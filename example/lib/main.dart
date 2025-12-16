@@ -2,13 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-import 'dart:io';
-
-import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:location/location.dart';
-import 'package:mapbox_gl/mapbox_gl.dart';
 
 import 'animate_camera.dart';
 import 'annotation_order_maps.dart';
@@ -71,22 +67,6 @@ class _MapsDemoState extends State<MapsDemo> {
   @override
   void initState() {
     super.initState();
-  }
-
-  /// Determine the android version of the phone and turn off HybridComposition
-  /// on older sdk versions to improve performance for these
-  ///
-  /// !!! Hybrid composition is currently broken do no use !!!
-  Future<void> initHybridComposition() async {
-    if (!kIsWeb && Platform.isAndroid) {
-      final androidInfo = await DeviceInfoPlugin().androidInfo;
-      final sdkVersion = androidInfo.version.sdkInt;
-      if (sdkVersion != null && sdkVersion >= 29) {
-        MapboxMap.useHybridComposition = true;
-      } else {
-        MapboxMap.useHybridComposition = false;
-      }
-    }
   }
 
   void _pushPage(BuildContext context, ExamplePage page) async {

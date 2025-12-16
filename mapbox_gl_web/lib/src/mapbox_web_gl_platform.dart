@@ -1,441 +1,578 @@
 part of mapbox_gl_web;
 
-const _mapboxGlCssUrl =
-    'https://api.mapbox.com/mapbox-gl-js/v2.7.0/mapbox-gl.css';
-
 class MapboxWebGlPlatform extends MapboxGlPlatform
     implements MapboxMapOptionsSink {
-  late DivElement _mapElement;
+  static const String _viewTypePrefix = 'plugins.flutter.io/mapbox_gl_';
+  static const String _defaultStyle = MapboxStyles.MAPBOX_STREETS;
+  static const int _defaultMaxZoom = 22;
 
+  late web.HTMLDivElement _mapElement;
   late Map<String, dynamic> _creationParams;
-  late MapboxMap _map;
+
+  JSObject? _map;
   bool _mapReady = false;
+
+  bool _dragEnabled = true;
   dynamic _draggedFeatureId;
   LatLng? _dragOrigin;
   LatLng? _dragPrevious;
-  bool _dragEnabled = true;
-  final _addedFeaturesByLayer = <String, FeatureCollection>{};
 
-  final _interactiveFeatureLayerIds = Set<String>();
+  final _interactiveFeatureLayerIds = <String>{};
 
   bool _trackCameraPosition = false;
-  GeolocateControl? _geolocateControl;
   LatLng? _myLastLocation;
 
+  JSObject? _geolocateControl;
+
+  JSObject? _navigationControl;
   String? _navigationControlPosition;
-  NavigationControl? _navigationControl;
-  Timer? lastResizeObserverTimer;
+
+  web.ResizeObserver? _resizeObserver;
+  Timer? _resizeObserverDebounce;
+
+  final _geoJsonBySourceId = <String, Map<String, dynamic>>{};
+  final _imageSourceDataUrlById = <String, String>{};
+
+  late final JSFunction _onStyleLoadedJs = ((JSAny? _) {
+    _onStyleLoaded();
+  }).toJS;
+
+  late final JSFunction _onMapClickJs = ((JSAny? e) {
+    _onMapClick(e);
+  }).toJS;
+
+  late final JSFunction _onMapLongClickJs = ((JSAny? e) {
+    _onMapLongClick(e);
+  }).toJS;
+
+  late final JSFunction _onCameraMoveStartedJs = ((JSAny? _) {
+    onCameraMoveStartedPlatform(null);
+  }).toJS;
+
+  late final JSFunction _onCameraMoveJs = ((JSAny? _) {
+    _onCameraMove();
+  }).toJS;
+
+  late final JSFunction _onCameraIdleJs = ((JSAny? _) {
+    _onCameraIdle();
+  }).toJS;
+
+  late final JSFunction _onResizeEventJs = ((JSAny? _) {
+    _onMapResize();
+  }).toJS;
+
+  late final JSFunction _onStyleImageMissingJs = ((JSAny? e) {
+    _loadMissingImageFromAssets(e);
+  }).toJS;
+
+  late final JSFunction _onMouseDownJs = ((JSAny? e) {
+    _onMouseDown(e);
+  }).toJS;
+
+  late final JSFunction _onMouseUpJs = ((JSAny? e) {
+    _onMouseUp(e);
+  }).toJS;
+
+  late final JSFunction _onMouseMoveJs = ((JSAny? e) {
+    _onMouseMove(e);
+  }).toJS;
+
+  late final JSFunction _onMouseEnterFeatureJs = ((JSAny? _) {
+    _onMouseEnterFeature();
+  }).toJS;
+
+  late final JSFunction _onMouseLeaveFeatureJs = ((JSAny? _) {
+    _onMouseLeaveFeature();
+  }).toJS;
+
+  JSObject get _mapOrThrow =>
+      _map ?? (throw StateError('Mapbox GL map is not initialized yet.'));
 
   @override
   Widget buildView(
-      Map<String, dynamic> creationParams,
-      OnPlatformViewCreatedCallback onPlatformViewCreated,
-      Set<Factory<OneSequenceGestureRecognizer>>? gestureRecognizers) {
+    Map<String, dynamic> creationParams,
+    OnPlatformViewCreatedCallback onPlatformViewCreated,
+    Set<Factory<OneSequenceGestureRecognizer>>? gestureRecognizers,
+  ) {
     _creationParams = creationParams;
-    _registerViewFactory(onPlatformViewCreated, this.hashCode);
-    return HtmlElementView(
-        viewType: 'plugins.flutter.io/mapbox_gl_${this.hashCode}');
+    final identifier = hashCode;
+    _registerViewFactory(onPlatformViewCreated, identifier);
+    return HtmlElementView(viewType: '$_viewTypePrefix$identifier');
+  }
+
+  void _registerViewFactory(
+    Function(int) callback,
+    int identifier,
+  ) {
+    ui_web.platformViewRegistry.registerViewFactory(
+      '$_viewTypePrefix$identifier',
+      (int viewId) {
+        _mapElement = web.HTMLDivElement()
+          ..style.position = 'absolute'
+          ..style.top = '0'
+          ..style.bottom = '0'
+          ..style.left = '0'
+          ..style.right = '0'
+          ..style.width = '100%'
+          ..style.height = '100%';
+        callback(viewId);
+        return _mapElement;
+      },
+    );
   }
 
   @override
   void dispose() {
     super.dispose();
-    _map.remove();
-  }
+    _resizeObserverDebounce?.cancel();
+    _resizeObserver?.disconnect();
 
-  void _registerViewFactory(Function(int) callback, int identifier) {
-    // ignore: undefined_prefixed_name
-    ui.platformViewRegistry.registerViewFactory(
-        'plugins.flutter.io/mapbox_gl_$identifier', (int viewId) {
-      _mapElement = DivElement()
-        ..style.position = 'absolute'
-        ..style.top = '0'
-        ..style.bottom = '0'
-        ..style.width = '100%';
-      callback(viewId);
-      return _mapElement;
-    });
+    for (final url in _imageSourceDataUrlById.values) {
+      if (url.startsWith('blob:')) {
+        try {
+          web.URL.revokeObjectURL(url);
+        } catch (_) {
+          // ignore
+        }
+      }
+    }
+    _imageSourceDataUrlById.clear();
+
+    try {
+      _mapOrThrow.callMethodVarArgs('remove'.toJS);
+    } catch (_) {
+      // ignore
+    }
   }
 
   @override
   Future<void> initPlatform(int id) async {
-    await _addStylesheetToShadowRoot(_mapElement);
-    if (_creationParams.containsKey('initialCameraPosition')) {
-      var camera = _creationParams['initialCameraPosition'];
-      _dragEnabled = _creationParams['dragEnabled'] ?? true;
+    _dragEnabled = _creationParams['dragEnabled'] ?? true;
 
-      if (_creationParams.containsKey('accessToken')) {
-        Mapbox.accessToken = _creationParams['accessToken'];
-      }
-      _map = MapboxMap(
-        MapOptions(
-          container: _mapElement,
-          style: 'mapbox://styles/mapbox/streets-v11',
-          center: LngLat(camera['target'][1], camera['target'][0]),
-          zoom: camera['zoom'],
-          bearing: camera['bearing'],
-          pitch: camera['tilt'],
-          preserveDrawingBuffer: true,
-        ),
-      );
-      _map.on('load', _onStyleLoaded);
-      _map.on('click', _onMapClick);
-      // long click not available in web, so it is mapped to double click
-      _map.on('dblclick', _onMapLongClick);
-      _map.on('movestart', _onCameraMoveStarted);
-      _map.on('move', _onCameraMove);
-      _map.on('moveend', _onCameraIdle);
-      _map.on('resize', (_) => _onMapResize());
-      _map.on('styleimagemissing', _loadFromAssets);
-      if (_dragEnabled) {
-        _map.on('mouseup', _onMouseUp);
-        _map.on('mousemove', _onMouseMove);
-      }
+    final jsUrl =
+        (_creationParams['mapboxGlJsUrl'] as String?) ?? _defaultMapboxGlJsUrl;
+    final cssUrl = (_creationParams['mapboxGlCssUrl'] as String?) ??
+        _defaultMapboxGlCssUrl;
+    await _ensureMapboxGlResourcesLoaded(jsUrl: jsUrl, cssUrl: cssUrl);
 
-      _initResizeObserver();
+    final accessToken = _creationParams['accessToken'];
+    if (accessToken is String && accessToken.isNotEmpty) {
+      _setMapboxAccessToken(accessToken);
     }
-    Convert.interpretMapboxMapOptions(_creationParams['options'], this);
+
+    final initialCamera = _creationParams['initialCameraPosition'];
+    if (initialCamera is! Map) {
+      throw StateError('Missing `initialCameraPosition` for Mapbox GL web.');
+    }
+
+    final target = initialCamera['target'];
+    if (target is! List || target.length != 2) {
+      throw StateError('Invalid `initialCameraPosition.target` payload.');
+    }
+
+    final center = <JSAny?>[
+      (target[1] as num).toJS,
+      (target[0] as num).toJS,
+    ].toJS;
+
+    final mapOptions = JSObject()
+      ..['container'] = _mapElement
+      ..['style'] = _defaultStyle.toJS
+      ..['center'] = center
+      ..['zoom'] = (initialCamera['zoom'] as num?)?.toJS
+      ..['bearing'] = (initialCamera['bearing'] as num?)?.toJS
+      ..['pitch'] = (initialCamera['tilt'] as num?)?.toJS
+      ..['preserveDrawingBuffer'] = true.toJS;
+
+    _map = _newMapboxGlObject('Map', mapOptions);
+
+    _mapOn('load', _onStyleLoadedJs);
+    _mapOn('click', _onMapClickJs);
+    // Long click is not available in Mapbox GL JS; map it to double-click.
+    _mapOn('dblclick', _onMapLongClickJs);
+    _mapOn('movestart', _onCameraMoveStartedJs);
+    _mapOn('move', _onCameraMoveJs);
+    _mapOn('moveend', _onCameraIdleJs);
+    _mapOn('resize', _onResizeEventJs);
+    _mapOn('styleimagemissing', _onStyleImageMissingJs);
+
+    if (_dragEnabled) {
+      _mapOn('mouseup', _onMouseUpJs);
+      _mapOn('mousemove', _onMouseMoveJs);
+    }
+
+    _initResizeObserver();
+
+    final options = _creationParams['options'];
+    if (options is Map<String, dynamic>) {
+      _applyOptionsUpdate(options);
+    }
+  }
+
+  void _mapOn(String eventType, JSFunction callback) {
+    _mapOrThrow.callMethodVarArgs('on'.toJS, [eventType.toJS, callback]);
+  }
+
+  void _mapOnce(String eventType, JSFunction callback) {
+    _mapOrThrow.callMethodVarArgs('once'.toJS, [eventType.toJS, callback]);
+  }
+
+  void _mapOffLayer(String eventType, String layerId, JSFunction callback) {
+    _mapOrThrow.callMethodVarArgs(
+      'off'.toJS,
+      [eventType.toJS, layerId.toJS, callback],
+    );
+  }
+
+  void _mapOnLayer(String eventType, String layerId, JSFunction callback) {
+    _mapOrThrow.callMethodVarArgs(
+      'on'.toJS,
+      [eventType.toJS, layerId.toJS, callback],
+    );
   }
 
   void _initResizeObserver() {
-    final resizeObserver = ResizeObserver((entries, observer) {
-      // The resize observer might be called a lot of times when the user resizes the browser window with the mouse for example.
-      // Due to the fact that the resize call is quite expensive it should not be called for every triggered event but only the last one, like "onMoveEnd".
-      // But because there is no event type for the end, there is only the option to spawn timers and cancel the previous ones if they get overwritten by a new event.
-      lastResizeObserverTimer?.cancel();
-      lastResizeObserverTimer = Timer(Duration(milliseconds: 50), () {
+    _resizeObserver?.disconnect();
+    _resizeObserverDebounce?.cancel();
+
+    _resizeObserver = web.ResizeObserver(((JSAny? _, JSAny? __) {
+      _resizeObserverDebounce?.cancel();
+      _resizeObserverDebounce = Timer(const Duration(milliseconds: 50), () {
         _onMapResize();
       });
-    });
-    resizeObserver.observe(document.body as Element);
+    }).toJS);
+
+    _resizeObserver!.observe(_mapElement);
   }
 
-  void _loadFromAssets(Event event) async {
-    final imagePath = event.id;
-    final ByteData bytes = await rootBundle.load(imagePath);
-    await addImage(imagePath, bytes.buffer.asUint8List());
-  }
-
-  _onMouseDown(Event e) {
-    var isDraggable = e.features[0].properties['draggable'];
-    if (isDraggable != null && isDraggable) {
-      // Prevent the default map drag behavior.
-      e.preventDefault();
-      _draggedFeatureId = e.features[0].id;
-      _map.getCanvas().style.cursor = 'grabbing';
-      var coords = e.lngLat;
-      _dragOrigin = LatLng(coords.lat as double, coords.lng as double);
-
-      if (_draggedFeatureId != null) {
-        final current =
-            LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble());
-        final payload = {
-          'id': _draggedFeatureId,
-          'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
-          'origin': _dragOrigin,
-          'current': current,
-          'delta': LatLng(0, 0),
-          'eventType': 'start'
-        };
-        onFeatureDraggedPlatform(payload);
+  void _applyOptionsUpdate(Map<String, dynamic> options) {
+    if (options.containsKey('cameraTargetBounds')) {
+      final bounds = options['cameraTargetBounds'][0];
+      if (bounds == null) {
+        setCameraTargetBounds(null);
+      } else {
+        setCameraTargetBounds(
+          LatLngBounds(
+            southwest: LatLng(bounds[0][0], bounds[0][1]),
+            northeast: LatLng(bounds[1][0], bounds[1][1]),
+          ),
+        );
       }
     }
-  }
-
-  _onMouseUp(Event e) {
-    if (_draggedFeatureId != null) {
-      final current = LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble());
-      final payload = {
-        'id': _draggedFeatureId,
-        'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
-        'origin': _dragOrigin,
-        'current': current,
-        'delta': current - (_dragPrevious ?? _dragOrigin!),
-        'eventType': 'end'
-      };
-      onFeatureDraggedPlatform(payload);
+    if (options.containsKey('compassEnabled')) {
+      setCompassEnabled(options['compassEnabled']);
     }
-    _draggedFeatureId = null;
-    _dragPrevious = null;
-    _dragOrigin = null;
-    _map.getCanvas().style.cursor = '';
-  }
-
-  _onMouseMove(Event e) {
-    if (_draggedFeatureId != null) {
-      final current = LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble());
-      final payload = {
-        'id': _draggedFeatureId,
-        'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
-        'origin': _dragOrigin,
-        'current': current,
-        'delta': current - (_dragPrevious ?? _dragOrigin!),
-        'eventType': 'drag'
-      };
-      _dragPrevious = current;
-      onFeatureDraggedPlatform(payload);
+    if (options.containsKey('styleString')) {
+      setStyleString(options['styleString']);
     }
-  }
-
-  Future<void> _addStylesheetToShadowRoot(HtmlElement e) async {
-    LinkElement link = LinkElement()
-      ..href = _mapboxGlCssUrl
-      ..rel = 'stylesheet';
-    e.append(link);
-
-    await link.onLoad.first;
-  }
-
-  @override
-  Future<CameraPosition?> updateMapOptions(
-      Map<String, dynamic> optionsUpdate) async {
-    // FIX: why is called indefinitely? (map_ui page)
-    Convert.interpretMapboxMapOptions(optionsUpdate, this);
-    return _getCameraPosition();
-  }
-
-  @override
-  Future<bool?> animateCamera(CameraUpdate cameraUpdate,
-      {Duration? duration}) async {
-    final cameraOptions = Convert.toCameraOptions(cameraUpdate, _map);
-
-    final around = getProperty(cameraOptions, 'around');
-    final bearing = getProperty(cameraOptions, 'bearing');
-    final center = getProperty(cameraOptions, 'center');
-    final pitch = getProperty(cameraOptions, 'pitch');
-    final zoom = getProperty(cameraOptions, 'zoom');
-
-    _map.flyTo({
-      if (around.jsObject != null) 'around': around,
-      if (bearing != null) 'bearing': bearing,
-      if (center.jsObject != null) 'center': center,
-      if (pitch != null) 'pitch': pitch,
-      if (zoom != null) 'zoom': zoom,
-      if (duration != null) 'duration': duration.inMilliseconds,
-    });
-
-    return true;
-  }
-
-  @override
-  Future<bool?> moveCamera(CameraUpdate cameraUpdate) async {
-    final cameraOptions = Convert.toCameraOptions(cameraUpdate, _map);
-    _map.jumpTo(cameraOptions);
-    return true;
-  }
-
-  @override
-  Future<void> updateMyLocationTrackingMode(
-      MyLocationTrackingMode myLocationTrackingMode) async {
-    setMyLocationTrackingMode(myLocationTrackingMode.index);
-  }
-
-  @override
-  Future<void> matchMapLanguageWithDeviceDefault() async {
-    setMapLanguage(ui.window.locale.languageCode);
-  }
-
-  @override
-  Future<void> setMapLanguage(String language) async {
-    _map.setLayoutProperty(
-      'country-label',
-      'text-field',
-      ['get', 'name_' + language],
-    );
-  }
-
-  @override
-  Future<void> setTelemetryEnabled(bool enabled) async {
-    print('Telemetry not available in web');
-    return;
-  }
-
-  @override
-  Future<bool> getTelemetryEnabled() async {
-    print('Telemetry not available in web');
-    return false;
-  }
-
-  @override
-  Future<List> queryRenderedFeatures(
-      Point<double> point, List<String> layerIds, List<Object>? filter) async {
-    Map<String, dynamic> options = {};
-    if (layerIds.length > 0) {
-      options['layers'] = layerIds;
-    }
-    if (filter != null) {
-      options['filter'] = filter;
-    }
-
-    // avoid issues with the js point type
-    final pointAsList = [point.x, point.y];
-    return _map
-        .queryRenderedFeatures([pointAsList, pointAsList], options)
-        .map((feature) => {
-              'type': 'Feature',
-              'id': feature.id,
-              'geometry': {
-                'type': feature.geometry.type,
-                'coordinates': feature.geometry.coordinates,
-              },
-              'properties': feature.properties,
-              'source': feature.source,
-            })
-        .toList();
-  }
-
-  @override
-  Future<List> queryRenderedFeaturesInRect(
-      Rect rect, List<String> layerIds, String? filter) async {
-    Map<String, dynamic> options = {};
-    if (layerIds.length > 0) {
-      options['layers'] = layerIds;
-    }
-    if (filter != null) {
-      options['filter'] = filter;
-    }
-    return _map
-        .queryRenderedFeatures([
-          [rect.left, rect.bottom],
-          [rect.right, rect.top],
-        ], options)
-        .map((feature) => {
-              'type': 'Feature',
-              'id': feature.id,
-              'geometry': {
-                'type': feature.geometry.type,
-                'coordinates': feature.geometry.coordinates,
-              },
-              'properties': feature.properties,
-              'source': feature.source,
-            })
-        .toList();
-  }
-
-  @override
-  Future invalidateAmbientCache() async {
-    print('Offline storage not available in web');
-  }
-
-  @override
-  Future<LatLng?> requestMyLocationLatLng() async {
-    return _myLastLocation;
-  }
-
-  @override
-  Future<LatLngBounds> getVisibleRegion() async {
-    final bounds = _map.getBounds();
-    return LatLngBounds(
-      southwest: LatLng(
-        bounds.getSouthWest().lat as double,
-        bounds.getSouthWest().lng as double,
-      ),
-      northeast: LatLng(
-        bounds.getNorthEast().lat as double,
-        bounds.getNorthEast().lng as double,
-      ),
-    );
-  }
-
-  @override
-  Future<void> addImage(String name, Uint8List bytes,
-      [bool sdf = false]) async {
-    final photo = decodeImage(bytes)!;
-    if (!_map.hasImage(name)) {
-      _map.addImage(
-        name,
-        {
-          'width': photo.width,
-          'height': photo.height,
-          'data': photo.getBytes(),
-        },
-        {'sdf': sdf},
+    if (options.containsKey('minMaxZoomPreference')) {
+      setMinMaxZoomPreference(
+        options['minMaxZoomPreference'][0],
+        options['minMaxZoomPreference'][1],
       );
     }
-  }
+    if (options['rotateGesturesEnabled'] != null &&
+        options['scrollGesturesEnabled'] != null &&
+        options['tiltGesturesEnabled'] != null &&
+        options['zoomGesturesEnabled'] != null &&
+        options['doubleClickZoomEnabled'] != null) {
+      setGestures(
+        rotateGesturesEnabled: options['rotateGesturesEnabled'],
+        scrollGesturesEnabled: options['scrollGesturesEnabled'],
+        tiltGesturesEnabled: options['tiltGesturesEnabled'],
+        zoomGesturesEnabled: options['zoomGesturesEnabled'],
+        doubleClickZoomEnabled: options['doubleClickZoomEnabled'],
+      );
+    }
 
-  @override
-  Future<void> removeSource(String sourceId) async {
-    _map.removeSource(sourceId);
+    if (options.containsKey('trackCameraPosition')) {
+      setTrackCameraPosition(options['trackCameraPosition']);
+    }
+
+    if (options.containsKey('myLocationEnabled')) {
+      setMyLocationEnabled(options['myLocationEnabled']);
+    }
+    if (options.containsKey('myLocationTrackingMode')) {
+      // Should not be invoked before setMyLocationEnabled().
+      setMyLocationTrackingMode(options['myLocationTrackingMode']);
+    }
+    if (options.containsKey('myLocationRenderMode')) {
+      setMyLocationRenderMode(options['myLocationRenderMode']);
+    }
+    if (options.containsKey('logoViewMargins')) {
+      setLogoViewMargins(
+          options['logoViewMargins'][0], options['logoViewMargins'][1]);
+    }
+    if (options.containsKey('compassViewPosition')) {
+      final position =
+          CompassViewPosition.values[options['compassViewPosition']];
+      setCompassAlignment(position);
+    }
+    if (options.containsKey('compassViewMargins')) {
+      setCompassViewMargins(
+        options['compassViewMargins'][0],
+        options['compassViewMargins'][1],
+      );
+    }
+    if (options.containsKey('attributionButtonPosition')) {
+      final position = AttributionButtonPosition
+          .values[options['attributionButtonPosition']];
+      setAttributionButtonAlignment(position);
+    }
+    if (options.containsKey('attributionButtonMargins')) {
+      setAttributionButtonMargins(
+        options['attributionButtonMargins'][0],
+        options['attributionButtonMargins'][1],
+      );
+    }
   }
 
   CameraPosition? _getCameraPosition() {
-    if (_trackCameraPosition) {
-      final center = _map.getCenter();
-      return CameraPosition(
-        bearing: _map.getBearing() as double,
-        target: LatLng(center.lat as double, center.lng as double),
-        tilt: _map.getPitch() as double,
-        zoom: _map.getZoom() as double,
-      );
-    }
-    return null;
+    if (!_trackCameraPosition) return null;
+    final center = _mapOrThrow.callMethodVarArgs<JSObject>('getCenter'.toJS);
+    final lat = (center['lat'] as JSNumber).toDartDouble;
+    final lng = (center['lng'] as JSNumber).toDartDouble;
+    final bearing =
+        _mapOrThrow.callMethodVarArgs<JSNumber>('getBearing'.toJS).toDartDouble;
+    final pitch =
+        _mapOrThrow.callMethodVarArgs<JSNumber>('getPitch'.toJS).toDartDouble;
+    final zoom =
+        _mapOrThrow.callMethodVarArgs<JSNumber>('getZoom'.toJS).toDartDouble;
+    return CameraPosition(
+      bearing: bearing,
+      target: LatLng(lat, lng),
+      tilt: pitch,
+      zoom: zoom,
+    );
   }
 
-  void _onStyleLoaded(_) {
+  void _onStyleLoaded() {
     _mapReady = true;
     _onMapResize();
     onMapStyleLoadedPlatform(null);
   }
 
   void _onMapResize() {
-    Timer(Duration(), () {
-      var container = _map.getContainer();
-      var canvas = _map.getCanvas();
-      var widthMismatch = canvas.clientWidth != container.clientWidth;
-      var heightMismatch = canvas.clientHeight != container.clientHeight;
+    Timer(Duration.zero, () {
+      final container =
+          _mapOrThrow.callMethodVarArgs<web.HTMLElement>('getContainer'.toJS);
+      final canvas = _mapOrThrow
+          .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS);
+      final widthMismatch = canvas.clientWidth != container.clientWidth;
+      final heightMismatch = canvas.clientHeight != container.clientHeight;
       if (widthMismatch || heightMismatch) {
-        _map.resize();
+        _mapOrThrow.callMethodVarArgs('resize'.toJS);
       }
     });
   }
 
-  void _onMapClick(Event e) {
-    final features = _map.queryRenderedFeatures([e.point.x, e.point.y],
-        {"layers": _interactiveFeatureLayerIds.toList()});
-    final payload = {
-      'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
-      'latLng': LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble()),
-      if (features.isNotEmpty) "id": features.first.id,
+  void _onMapClick(JSAny? event) {
+    final e = event as JSObject;
+    final point = e['point'] as JSObject;
+    final lngLat = e['lngLat'] as JSObject;
+
+    final pointDart = Point<double>(
+      (point['x'] as JSNumber).toDartDouble,
+      (point['y'] as JSNumber).toDartDouble,
+    );
+    final latLngDart = LatLng(
+      (lngLat['lat'] as JSNumber).toDartDouble,
+      (lngLat['lng'] as JSNumber).toDartDouble,
+    );
+
+    dynamic id;
+    if (_interactiveFeatureLayerIds.isNotEmpty) {
+      final options = JSObject()
+        ..['layers'] = _interactiveFeatureLayerIds
+            .map((l) => l.toJS)
+            .toList(growable: false)
+            .toJS;
+
+      final queryPoint = <JSAny?>[
+        (point['x'] as JSNumber),
+        (point['y'] as JSNumber),
+      ].toJS;
+
+      final features = _mapOrThrow.callMethodVarArgs<JSArray<JSAny?>>(
+        'queryRenderedFeatures'.toJS,
+        [queryPoint, options],
+      );
+
+      if (features.length > 0) {
+        final first = features[0] as JSObject;
+        id = _dartifyViaJson(first['id']);
+      }
+    }
+
+    final payload = <String, dynamic>{
+      'point': pointDart,
+      'latLng': latLngDart,
+      if (id != null) 'id': id,
     };
-    if (features.isNotEmpty) {
+
+    if (id != null) {
       onFeatureTappedPlatform(payload);
     } else {
       onMapClickPlatform(payload);
     }
   }
 
-  void _onMapLongClick(e) {
+  void _onMapLongClick(JSAny? event) {
+    final e = event as JSObject;
+    final point = e['point'] as JSObject;
+    final lngLat = e['lngLat'] as JSObject;
+
     onMapLongClickPlatform({
-      'point': Point<double>(e.point.x, e.point.y),
-      'latLng': LatLng(e.lngLat.lat, e.lngLat.lng),
+      'point': Point<double>(
+        (point['x'] as JSNumber).toDartDouble,
+        (point['y'] as JSNumber).toDartDouble,
+      ),
+      'latLng': LatLng(
+        (lngLat['lat'] as JSNumber).toDartDouble,
+        (lngLat['lng'] as JSNumber).toDartDouble,
+      ),
     });
   }
 
-  void _onCameraMoveStarted(_) {
-    onCameraMoveStartedPlatform(null);
+  void _onCameraMove() {
+    final camera = _getCameraPosition();
+    if (camera != null) {
+      onCameraMovePlatform(camera);
+    }
   }
 
-  void _onCameraMove(_) {
-    final center = _map.getCenter();
-    var camera = CameraPosition(
-      bearing: _map.getBearing() as double,
-      target: LatLng(center.lat as double, center.lng as double),
-      tilt: _map.getPitch() as double,
-      zoom: _map.getZoom() as double,
-    );
-    onCameraMovePlatform(camera);
+  void _onCameraIdle() {
+    onCameraIdlePlatform(_getCameraPosition());
   }
 
-  void _onCameraIdle(_) {
-    final center = _map.getCenter();
-    var camera = CameraPosition(
-      bearing: _map.getBearing() as double,
-      target: LatLng(center.lat as double, center.lng as double),
-      tilt: _map.getPitch() as double,
-      zoom: _map.getZoom() as double,
+  Future<void> _loadMissingImageFromAssets(JSAny? event) async {
+    final e = event as JSObject;
+    final idAny = e['id'];
+    final imageId = (idAny as JSString?)?.toDart;
+    if (imageId == null || imageId.isEmpty) return;
+
+    final bytes = await rootBundle.load(imageId);
+    await addImage(imageId, bytes.buffer.asUint8List());
+  }
+
+  void _onMouseDown(JSAny? event) {
+    final e = event as JSObject;
+    final featuresAny = e['features'];
+    if (featuresAny == null) return;
+
+    final features = featuresAny as JSArray<JSAny?>;
+    if (features.length == 0) return;
+    final feature = features[0] as JSObject;
+
+    final propertiesAny = feature['properties'];
+    final properties = propertiesAny == null ? null : propertiesAny as JSObject;
+    final draggable = properties?['draggable'];
+    final isDraggable = (draggable as JSBoolean?)?.toDart ?? false;
+    if (!isDraggable) return;
+
+    // Prevent the default map drag behavior.
+    e.callMethodVarArgs('preventDefault'.toJS);
+
+    _draggedFeatureId = _dartifyViaJson(feature['id']);
+    _mapOrThrow
+        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
+        .style
+        .cursor = 'grabbing';
+
+    final lngLat = e['lngLat'] as JSObject;
+    _dragOrigin = LatLng(
+      (lngLat['lat'] as JSNumber).toDartDouble,
+      (lngLat['lng'] as JSNumber).toDartDouble,
     );
-    onCameraIdlePlatform(camera);
+
+    if (_draggedFeatureId == null) return;
+
+    final point = e['point'] as JSObject;
+    final current = LatLng(
+      (lngLat['lat'] as JSNumber).toDartDouble,
+      (lngLat['lng'] as JSNumber).toDartDouble,
+    );
+
+    onFeatureDraggedPlatform({
+      'id': _draggedFeatureId,
+      'point': Point<double>(
+        (point['x'] as JSNumber).toDartDouble,
+        (point['y'] as JSNumber).toDartDouble,
+      ),
+      'origin': _dragOrigin,
+      'current': current,
+      'delta': const LatLng(0, 0),
+      'eventType': 'start',
+    });
+  }
+
+  void _onMouseUp(JSAny? event) {
+    if (_draggedFeatureId != null && _dragOrigin != null) {
+      final e = event as JSObject;
+      final point = e['point'] as JSObject;
+      final lngLat = e['lngLat'] as JSObject;
+      final current = LatLng(
+        (lngLat['lat'] as JSNumber).toDartDouble,
+        (lngLat['lng'] as JSNumber).toDartDouble,
+      );
+      onFeatureDraggedPlatform({
+        'id': _draggedFeatureId,
+        'point': Point<double>(
+          (point['x'] as JSNumber).toDartDouble,
+          (point['y'] as JSNumber).toDartDouble,
+        ),
+        'origin': _dragOrigin,
+        'current': current,
+        'delta': current - (_dragPrevious ?? _dragOrigin!),
+        'eventType': 'end',
+      });
+    }
+
+    _draggedFeatureId = null;
+    _dragPrevious = null;
+    _dragOrigin = null;
+    _mapOrThrow
+        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
+        .style
+        .cursor = '';
+  }
+
+  void _onMouseMove(JSAny? event) {
+    if (_draggedFeatureId == null || _dragOrigin == null) return;
+    final e = event as JSObject;
+    final point = e['point'] as JSObject;
+    final lngLat = e['lngLat'] as JSObject;
+    final current = LatLng(
+      (lngLat['lat'] as JSNumber).toDartDouble,
+      (lngLat['lng'] as JSNumber).toDartDouble,
+    );
+    onFeatureDraggedPlatform({
+      'id': _draggedFeatureId,
+      'point': Point<double>(
+        (point['x'] as JSNumber).toDartDouble,
+        (point['y'] as JSNumber).toDartDouble,
+      ),
+      'origin': _dragOrigin,
+      'current': current,
+      'delta': current - (_dragPrevious ?? _dragOrigin!),
+      'eventType': 'drag',
+    });
+    _dragPrevious = current;
+  }
+
+  void _onMouseEnterFeature() {
+    if (_draggedFeatureId != null) return;
+    _mapOrThrow
+        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
+        .style
+        .cursor = 'pointer';
+  }
+
+  void _onMouseLeaveFeature() {
+    _mapOrThrow
+        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
+        .style
+        .cursor = '';
   }
 
   void _onCameraTrackingChanged(bool isTracking) {
@@ -450,55 +587,97 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
     onCameraTrackingDismissedPlatform(null);
   }
 
-  void _addGeolocateControl({bool trackUserLocation = false}) {
-    _removeGeolocateControl();
-    _geolocateControl = GeolocateControl(
-      GeolocateControlOptions(
-        positionOptions: PositionOptions(enableHighAccuracy: true),
-        trackUserLocation: trackUserLocation,
-        showAccuracyCircle: true,
-        showUserLocation: true,
-      ),
-    );
-    _geolocateControl!.on('geolocate', (e) {
-      _myLastLocation = LatLng(e.coords.latitude, e.coords.longitude);
-      onUserLocationUpdatedPlatform(UserLocation(
-          position: LatLng(e.coords.latitude, e.coords.longitude),
-          altitude: e.coords.altitude,
-          bearing: e.coords.heading,
-          speed: e.coords.speed,
-          horizontalAccuracy: e.coords.accuracy,
-          verticalAccuracy: e.coords.altitudeAccuracy,
-          heading: null,
-          timestamp: DateTime.fromMillisecondsSinceEpoch(e.timestamp)));
-    });
-    _geolocateControl!.on('trackuserlocationstart', (_) {
-      _onCameraTrackingChanged(true);
-    });
-    _geolocateControl!.on('trackuserlocationend', (_) {
-      _onCameraTrackingChanged(false);
-      _onCameraTrackingDismissed();
-    });
-    _map.addControl(_geolocateControl, 'bottom-right');
+  void _removeGeolocateControl() {
+    if (_geolocateControl == null) return;
+    _mapOrThrow.callMethodVarArgs('removeControl'.toJS, [_geolocateControl!]);
+    _geolocateControl = null;
   }
 
-  void _removeGeolocateControl() {
-    if (_geolocateControl != null) {
-      _map.removeControl(_geolocateControl);
-      _geolocateControl = null;
-    }
+  void _addGeolocateControl({required bool trackUserLocation}) {
+    _removeGeolocateControl();
+
+    final positionOptions = JSObject()..['enableHighAccuracy'] = true.toJS;
+    final options = JSObject()
+      ..['positionOptions'] = positionOptions
+      ..['trackUserLocation'] = trackUserLocation.toJS
+      ..['showAccuracyCircle'] = true.toJS
+      ..['showUserLocation'] = true.toJS;
+
+    _geolocateControl = _newMapboxGlObject('GeolocateControl', options);
+
+    final onGeolocate = ((JSAny? event) {
+      final e = event as JSObject;
+      final coords = e['coords'] as JSObject?;
+      if (coords == null) return;
+
+      final latAny = coords['latitude'];
+      final lngAny = coords['longitude'];
+      if (latAny == null || lngAny == null) return;
+
+      final lat = (latAny as JSNumber).toDartDouble;
+      final lng = (lngAny as JSNumber).toDartDouble;
+      _myLastLocation = LatLng(lat, lng);
+
+      double? _doubleOrNull(JSAny? v) =>
+          v == null ? null : (v as JSNumber).toDartDouble;
+
+      final timestampAny = e['timestamp'];
+      final timestampMs = (timestampAny as JSNumber?)?.toDartDouble;
+
+      onUserLocationUpdatedPlatform(
+        UserLocation(
+          position: LatLng(lat, lng),
+          altitude: _doubleOrNull(coords['altitude']),
+          bearing: _doubleOrNull(coords['heading']),
+          speed: _doubleOrNull(coords['speed']),
+          horizontalAccuracy: _doubleOrNull(coords['accuracy']),
+          verticalAccuracy: _doubleOrNull(coords['altitudeAccuracy']),
+          heading: null,
+          timestamp: timestampMs == null
+              ? DateTime.now()
+              : DateTime.fromMillisecondsSinceEpoch(timestampMs.round()),
+        ),
+      );
+    }).toJS;
+
+    final onTrackStart = ((JSAny? _) {
+      _onCameraTrackingChanged(true);
+    }).toJS;
+
+    final onTrackEnd = ((JSAny? _) {
+      _onCameraTrackingChanged(false);
+      _onCameraTrackingDismissed();
+    }).toJS;
+
+    _geolocateControl!.callMethodVarArgs(
+      'on'.toJS,
+      ['geolocate'.toJS, onGeolocate],
+    );
+    _geolocateControl!.callMethodVarArgs(
+      'on'.toJS,
+      ['trackuserlocationstart'.toJS, onTrackStart],
+    );
+    _geolocateControl!.callMethodVarArgs(
+      'on'.toJS,
+      ['trackuserlocationend'.toJS, onTrackEnd],
+    );
+
+    _mapOrThrow.callMethodVarArgs(
+      'addControl'.toJS,
+      [_geolocateControl!, 'bottom-right'.toJS],
+    );
+  }
+
+  void _removeNavigationControl() {
+    if (_navigationControl == null) return;
+    _mapOrThrow.callMethodVarArgs('removeControl'.toJS, [_navigationControl!]);
+    _navigationControl = null;
   }
 
   void _updateNavigationControl({
     bool? compassEnabled,
     CompassViewPosition? position,
   }) {
-    bool? prevShowCompass;
-    if (_navigationControl != null) {
-      prevShowCompass = _navigationControl!.options.showCompass;
-    }
-    String? prevPosition = _navigationControlPosition;
-
     String? positionString;
     switch (position) {
       case CompassViewPosition.TopRight:
@@ -517,29 +696,948 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
         positionString = null;
     }
 
-    bool newShowComapss = compassEnabled ?? prevShowCompass ?? false;
-    String? newPosition = positionString ?? prevPosition ?? null;
+    final newShowCompass = compassEnabled ??
+        ((_navigationControl?['options'] as JSObject?)?['showCompass']
+                as JSBoolean?)
+            ?.toDart ??
+        false;
+    final newPosition = positionString ?? _navigationControlPosition;
 
     _removeNavigationControl();
-    _navigationControl = NavigationControl(NavigationControlOptions(
-      showCompass: newShowComapss,
-      showZoom: false,
-      visualizePitch: false,
-    ));
+
+    final options = JSObject()
+      ..['showCompass'] = newShowCompass.toJS
+      ..['showZoom'] = false.toJS
+      ..['visualizePitch'] = false.toJS;
+
+    _navigationControl = _newMapboxGlObject('NavigationControl', options);
 
     if (newPosition == null) {
-      _map.addControl(_navigationControl);
+      _mapOrThrow.callMethodVarArgs('addControl'.toJS, [_navigationControl!]);
     } else {
-      _map.addControl(_navigationControl, newPosition);
+      _mapOrThrow.callMethodVarArgs(
+        'addControl'.toJS,
+        [_navigationControl!, newPosition.toJS],
+      );
       _navigationControlPosition = newPosition;
     }
   }
 
-  void _removeNavigationControl() {
-    if (_navigationControl != null) {
-      _map.removeControl(_navigationControl);
-      _navigationControl = null;
+  void _setHandlerEnabled(String handlerName, bool enabled) {
+    final handler = _mapOrThrow[handlerName] as JSObject?;
+    if (handler == null) return;
+    handler.callMethodVarArgs(enabled ? 'enable'.toJS : 'disable'.toJS);
+  }
+
+  @override
+  Future<CameraPosition?> updateMapOptions(
+    Map<String, dynamic> optionsUpdate,
+  ) async {
+    _applyOptionsUpdate(optionsUpdate);
+    return _getCameraPosition();
+  }
+
+  @override
+  Future<bool?> animateCamera(
+    CameraUpdate cameraUpdate, {
+    Duration? duration,
+  }) async {
+    _applyCameraUpdate(cameraUpdate, duration: duration);
+    return true;
+  }
+
+  @override
+  Future<bool?> moveCamera(CameraUpdate cameraUpdate) async {
+    _applyCameraUpdate(cameraUpdate, duration: Duration.zero);
+    return true;
+  }
+
+  void _applyCameraUpdate(CameraUpdate cameraUpdate, {Duration? duration}) {
+    final json = cameraUpdate.toJson();
+    if (json is! List || json.isEmpty) {
+      throw ArgumentError.value(json, 'cameraUpdate', 'Invalid CameraUpdate');
     }
+
+    final type = json[0];
+    final ms = (duration ?? const Duration(milliseconds: 250)).inMilliseconds;
+
+    JSObject optionsFromPadding(num left, num top, num right, num bottom) {
+      return JSObject()
+        ..['padding'] = (JSObject()
+          ..['left'] = left.toJS
+          ..['top'] = top.toJS
+          ..['right'] = right.toJS
+          ..['bottom'] = bottom.toJS)
+        ..['duration'] = ms.toJS;
+    }
+
+    switch (type) {
+      case 'newCameraPosition':
+        final camera = json[1] as Map;
+        final target = camera['target'] as List;
+        final opts = JSObject()
+          ..['center'] = <JSAny?>[
+            (target[1] as num).toJS,
+            (target[0] as num).toJS,
+          ].toJS
+          ..['zoom'] = (camera['zoom'] as num?)?.toJS
+          ..['bearing'] = (camera['bearing'] as num?)?.toJS
+          ..['pitch'] = (camera['tilt'] as num?)?.toJS
+          ..['duration'] = ms.toJS;
+        _mapOrThrow.callMethodVarArgs('flyTo'.toJS, [opts]);
+        return;
+
+      case 'newLatLng':
+        final target = json[1] as List;
+        final opts = JSObject()
+          ..['center'] = <JSAny?>[
+            (target[1] as num).toJS,
+            (target[0] as num).toJS,
+          ].toJS
+          ..['duration'] = ms.toJS;
+        _mapOrThrow.callMethodVarArgs('flyTo'.toJS, [opts]);
+        return;
+
+      case 'newLatLngBounds':
+        final bounds = json[1] as List;
+        final left = json[2] as num;
+        final top = json[3] as num;
+        final right = json[4] as num;
+        final bottom = json[5] as num;
+        final sw = bounds[0] as List;
+        final ne = bounds[1] as List;
+        final jsBounds = <JSAny?>[
+          <JSAny?>[(sw[1] as num).toJS, (sw[0] as num).toJS].toJS,
+          <JSAny?>[(ne[1] as num).toJS, (ne[0] as num).toJS].toJS,
+        ].toJS;
+        _mapOrThrow.callMethodVarArgs(
+          'fitBounds'.toJS,
+          [jsBounds, optionsFromPadding(left, top, right, bottom)],
+        );
+        return;
+
+      case 'newLatLngZoom':
+        final target = json[1] as List;
+        final zoom = json[2] as num;
+        final opts = JSObject()
+          ..['center'] = <JSAny?>[
+            (target[1] as num).toJS,
+            (target[0] as num).toJS,
+          ].toJS
+          ..['zoom'] = zoom.toJS
+          ..['duration'] = ms.toJS;
+        _mapOrThrow.callMethodVarArgs('flyTo'.toJS, [opts]);
+        return;
+
+      case 'scrollBy':
+        final dx = json[1] as num;
+        final dy = json[2] as num;
+        final opts = JSObject()..['duration'] = ms.toJS;
+        _mapOrThrow.callMethodVarArgs(
+          'panBy'.toJS,
+          [
+            <JSAny?>[dx.toJS, dy.toJS].toJS,
+            opts
+          ],
+        );
+        return;
+
+      case 'zoomBy':
+        final amount = json[1] as num;
+        final currentZoom = _mapOrThrow
+            .callMethodVarArgs<JSNumber>('getZoom'.toJS)
+            .toDartDouble;
+        final newZoom = (currentZoom + amount).toJS;
+        final opts = JSObject()
+          ..['zoom'] = newZoom
+          ..['duration'] = ms.toJS;
+        if (json.length == 3) {
+          final focus = json[2] as List;
+          final point = JSObject()
+            ..['x'] = (focus[0] as num).toJS
+            ..['y'] = (focus[1] as num).toJS;
+          final around = _mapOrThrow.callMethodVarArgs<JSObject>(
+            'unproject'.toJS,
+            [point],
+          );
+          opts['around'] = around;
+        }
+        _mapOrThrow.callMethodVarArgs('easeTo'.toJS, [opts]);
+        return;
+
+      case 'zoomIn':
+        _mapOrThrow.callMethodVarArgs('zoomIn'.toJS, [
+          JSObject()..['duration'] = ms.toJS,
+        ]);
+        return;
+
+      case 'zoomOut':
+        _mapOrThrow.callMethodVarArgs('zoomOut'.toJS, [
+          JSObject()..['duration'] = ms.toJS,
+        ]);
+        return;
+
+      case 'zoomTo':
+        final zoom = json[1] as num;
+        _mapOrThrow.callMethodVarArgs('easeTo'.toJS, [
+          JSObject()
+            ..['zoom'] = zoom.toJS
+            ..['duration'] = ms.toJS
+        ]);
+        return;
+
+      case 'bearingTo':
+        final bearing = json[1] as num;
+        _mapOrThrow.callMethodVarArgs('easeTo'.toJS, [
+          JSObject()
+            ..['bearing'] = bearing.toJS
+            ..['duration'] = ms.toJS
+        ]);
+        return;
+
+      case 'tiltTo':
+        final pitch = json[1] as num;
+        _mapOrThrow.callMethodVarArgs('easeTo'.toJS, [
+          JSObject()
+            ..['pitch'] = pitch.toJS
+            ..['duration'] = ms.toJS
+        ]);
+        return;
+
+      default:
+        throw UnimplementedError('Unsupported CameraUpdate: $type');
+    }
+  }
+
+  @override
+  Future<void> updateMyLocationTrackingMode(
+    MyLocationTrackingMode myLocationTrackingMode,
+  ) async {
+    setMyLocationTrackingMode(myLocationTrackingMode.index);
+  }
+
+  @override
+  Future<void> matchMapLanguageWithDeviceDefault() async {
+    setMapLanguage(ui.PlatformDispatcher.instance.locale.languageCode);
+  }
+
+  @override
+  Future<void> setMapLanguage(String language) async {
+    _mapOrThrow.callMethodVarArgs(
+      'setLayoutProperty'.toJS,
+      [
+        'country-label'.toJS,
+        'text-field'.toJS,
+        _jsify(['get', 'name_$language']),
+      ],
+    );
+  }
+
+  @override
+  Future<void> setTelemetryEnabled(bool enabled) async {
+    debugPrint('Telemetry not available in web');
+  }
+
+  @override
+  Future<bool> getTelemetryEnabled() async {
+    debugPrint('Telemetry not available in web');
+    return false;
+  }
+
+  @override
+  Future<List> queryRenderedFeatures(
+    Point<double> point,
+    List<String> layerIds,
+    List<Object>? filter,
+  ) async {
+    final options = JSObject();
+    if (layerIds.isNotEmpty) {
+      options['layers'] = layerIds.map((l) => l.toJS).toList().toJS;
+    }
+    if (filter != null) {
+      options['filter'] = _jsify(filter);
+    }
+
+    final p = <JSAny?>[point.x.toJS, point.y.toJS].toJS;
+    final bbox = <JSAny?>[p, p].toJS;
+    final features = _mapOrThrow.callMethodVarArgs<JSArray<JSAny?>>(
+      'queryRenderedFeatures'.toJS,
+      [bbox, options],
+    );
+
+    final out = <dynamic>[];
+    for (var i = 0; i < features.length; i++) {
+      final fAny = features[i];
+      final f = _dartifyViaJson(fAny) as Map<String, dynamic>;
+      out.add({
+        'type': 'Feature',
+        'id': f['id'],
+        'geometry': f['geometry'],
+        'properties': f['properties'],
+        'source': f['source'],
+      });
+    }
+    return out;
+  }
+
+  @override
+  Future<List> queryRenderedFeaturesInRect(
+    Rect rect,
+    List<String> layerIds,
+    String? filter,
+  ) async {
+    final options = JSObject();
+    if (layerIds.isNotEmpty) {
+      options['layers'] = layerIds.map((l) => l.toJS).toList().toJS;
+    }
+    if (filter != null && filter.isNotEmpty) {
+      try {
+        options['filter'] = _jsify(jsonDecode(filter));
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    final bbox = <JSAny?>[
+      <JSAny?>[rect.left.toJS, rect.bottom.toJS].toJS,
+      <JSAny?>[rect.right.toJS, rect.top.toJS].toJS,
+    ].toJS;
+
+    final features = _mapOrThrow.callMethodVarArgs<JSArray<JSAny?>>(
+      'queryRenderedFeatures'.toJS,
+      [bbox, options],
+    );
+
+    final out = <dynamic>[];
+    for (var i = 0; i < features.length; i++) {
+      final fAny = features[i];
+      final f = _dartifyViaJson(fAny) as Map<String, dynamic>;
+      out.add({
+        'type': 'Feature',
+        'id': f['id'],
+        'geometry': f['geometry'],
+        'properties': f['properties'],
+        'source': f['source'],
+      });
+    }
+    return out;
+  }
+
+  @override
+  Future invalidateAmbientCache() async {
+    debugPrint('Offline storage not available in web');
+  }
+
+  @override
+  Future<LatLng?> requestMyLocationLatLng() async => _myLastLocation;
+
+  @override
+  Future<LatLngBounds> getVisibleRegion() async {
+    final bounds = _mapOrThrow.callMethodVarArgs<JSObject>('getBounds'.toJS);
+    final sw = bounds.callMethodVarArgs<JSObject>('getSouthWest'.toJS);
+    final ne = bounds.callMethodVarArgs<JSObject>('getNorthEast'.toJS);
+    return LatLngBounds(
+      southwest: LatLng(
+        (sw['lat'] as JSNumber).toDartDouble,
+        (sw['lng'] as JSNumber).toDartDouble,
+      ),
+      northeast: LatLng(
+        (ne['lat'] as JSNumber).toDartDouble,
+        (ne['lng'] as JSNumber).toDartDouble,
+      ),
+    );
+  }
+
+  @override
+  Future<void> addImage(String name, Uint8List bytes,
+      [bool sdf = false]) async {
+    final decoded = decodeImage(bytes);
+    if (decoded == null) return;
+
+    final hasImage = _mapOrThrow
+        .callMethodVarArgs<JSBoolean>('hasImage'.toJS, [name.toJS]).toDart;
+    if (hasImage) return;
+
+    final image = JSObject()
+      ..['width'] = decoded.width.toJS
+      ..['height'] = decoded.height.toJS
+      ..['data'] = decoded.getBytes().toJS;
+
+    _mapOrThrow.callMethodVarArgs(
+      'addImage'.toJS,
+      [
+        name.toJS,
+        image,
+        JSObject()..['sdf'] = sdf.toJS,
+      ],
+    );
+  }
+
+  @override
+  Future<void> addGeoJsonSource(
+    String sourceId,
+    Map<String, dynamic> geojson, {
+    String? promoteId,
+  }) async {
+    _geoJsonBySourceId[sourceId] = geojson;
+    final source = JSObject()
+      ..['type'] = 'geojson'.toJS
+      ..['data'] = _jsify(geojson);
+    if (promoteId != null) {
+      source['promoteId'] = promoteId.toJS;
+    }
+    _mapOrThrow.callMethodVarArgs('addSource'.toJS, [sourceId.toJS, source]);
+  }
+
+  @override
+  Future<void> setGeoJsonSource(
+    String sourceId,
+    Map<String, dynamic> geojson,
+  ) async {
+    _geoJsonBySourceId[sourceId] = geojson;
+    final source = _mapOrThrow
+        .callMethodVarArgs<JSObject>('getSource'.toJS, [sourceId.toJS]);
+    source.callMethodVarArgs('setData'.toJS, [_jsify(geojson)]);
+  }
+
+  @override
+  Future<void> setFeatureForGeoJsonSource(
+    String sourceId,
+    Map<String, dynamic> geojsonFeature,
+  ) async {
+    final data = _geoJsonBySourceId[sourceId];
+    if (data == null) return;
+
+    final features = (data['features'] as List?)?.toList() ?? <dynamic>[];
+
+    dynamic featureId =
+        geojsonFeature['properties']?['id'] ?? geojsonFeature['id'];
+    if (featureId == null) return;
+
+    final index = features.indexWhere((f) {
+      if (f is! Map) return false;
+      return f['properties']?['id'] == featureId || f['id'] == featureId;
+    });
+    if (index < 0) return;
+
+    features[index] = geojsonFeature;
+    final updated = <String, dynamic>{
+      ...data,
+      'features': features,
+    };
+    _geoJsonBySourceId[sourceId] = updated;
+
+    final source = _mapOrThrow
+        .callMethodVarArgs<JSObject>('getSource'.toJS, [sourceId.toJS]);
+    source.callMethodVarArgs('setData'.toJS, [_jsify(updated)]);
+  }
+
+  @override
+  Future<void> removeSource(String sourceId) async {
+    final source = _mapOrThrow
+        .callMethodVarArgs<JSAny?>('getSource'.toJS, [sourceId.toJS]);
+    if (source == null) return;
+    _geoJsonBySourceId.remove(sourceId);
+    _mapOrThrow.callMethodVarArgs('removeSource'.toJS, [sourceId.toJS]);
+  }
+
+  @override
+  Future<void> addSymbolLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'symbol',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      filter: filter,
+      enableInteraction: enableInteraction,
+    );
+  }
+
+  @override
+  Future<void> addLineLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'line',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      filter: filter,
+      enableInteraction: enableInteraction,
+    );
+  }
+
+  @override
+  Future<void> addCircleLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'circle',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      filter: filter,
+      enableInteraction: enableInteraction,
+    );
+  }
+
+  @override
+  Future<void> addFillLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'fill',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      filter: filter,
+      enableInteraction: enableInteraction,
+    );
+  }
+
+  @override
+  Future<void> addFillExtrusionLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'fill-extrusion',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      filter: filter,
+      enableInteraction: enableInteraction,
+    );
+  }
+
+  @override
+  Future<void> addRasterLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'raster',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      enableInteraction: false,
+    );
+  }
+
+  @override
+  Future<void> addHillshadeLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'hillshade',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      enableInteraction: false,
+    );
+  }
+
+  @override
+  Future<void> addHeatmapLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+  }) async {
+    await _addStyleLayer(
+      sourceId,
+      layerId,
+      properties,
+      'heatmap',
+      belowLayerId: belowLayerId,
+      sourceLayer: sourceLayer,
+      minzoom: minzoom,
+      maxzoom: maxzoom,
+      enableInteraction: false,
+    );
+  }
+
+  Future<void> _addStyleLayer(
+    String sourceId,
+    String layerId,
+    Map<String, dynamic> properties,
+    String layerType, {
+    String? belowLayerId,
+    String? sourceLayer,
+    double? minzoom,
+    double? maxzoom,
+    dynamic filter,
+    required bool enableInteraction,
+  }) async {
+    final layout = Map.fromEntries(
+      properties.entries.where((entry) => isLayoutProperty(entry.key)),
+    );
+    final paint = Map.fromEntries(
+      properties.entries.where((entry) => !isLayoutProperty(entry.key)),
+    );
+
+    await removeLayer(layerId);
+
+    final layer = JSObject()
+      ..['id'] = layerId.toJS
+      ..['type'] = layerType.toJS
+      ..['source'] = sourceId.toJS
+      ..['layout'] = _jsify(layout)
+      ..['paint'] = _jsify(paint);
+
+    if (sourceLayer != null) layer['source-layer'] = sourceLayer.toJS;
+    if (minzoom != null) layer['minzoom'] = minzoom.toJS;
+    if (maxzoom != null) layer['maxzoom'] = maxzoom.toJS;
+    if (filter != null) layer['filter'] = _jsify(filter);
+
+    _mapOrThrow.callMethodVarArgs(
+      'addLayer'.toJS,
+      [layer, if (belowLayerId != null) belowLayerId.toJS],
+    );
+
+    if (enableInteraction) {
+      _interactiveFeatureLayerIds.add(layerId);
+      if (layerType == 'fill') {
+        _mapOnLayer('mousemove', layerId, _onMouseEnterFeatureJs);
+      } else {
+        _mapOnLayer('mouseenter', layerId, _onMouseEnterFeatureJs);
+      }
+      _mapOnLayer('mouseleave', layerId, _onMouseLeaveFeatureJs);
+      if (_dragEnabled) _mapOnLayer('mousedown', layerId, _onMouseDownJs);
+    }
+  }
+
+  @override
+  Future<void> removeLayer(String layerId) async {
+    final layer =
+        _mapOrThrow.callMethodVarArgs<JSAny?>('getLayer'.toJS, [layerId.toJS]);
+    if (layer == null) return;
+
+    _interactiveFeatureLayerIds.remove(layerId);
+    _mapOffLayer('mouseenter', layerId, _onMouseEnterFeatureJs);
+    _mapOffLayer('mousemove', layerId, _onMouseEnterFeatureJs);
+    _mapOffLayer('mouseleave', layerId, _onMouseLeaveFeatureJs);
+    if (_dragEnabled) _mapOffLayer('mousedown', layerId, _onMouseDownJs);
+
+    _mapOrThrow.callMethodVarArgs('removeLayer'.toJS, [layerId.toJS]);
+  }
+
+  @override
+  Future<void> setFilter(String layerId, dynamic filter) async {
+    _mapOrThrow.callMethodVarArgs(
+      'setFilter'.toJS,
+      [layerId.toJS, _jsify(filter)],
+    );
+  }
+
+  @override
+  Future<void> setVisibility(String layerId, bool isVisible) async {
+    final layer =
+        _mapOrThrow.callMethodVarArgs<JSAny?>('getLayer'.toJS, [layerId.toJS]);
+    if (layer == null) return;
+    _mapOrThrow.callMethodVarArgs(
+      'setLayoutProperty'.toJS,
+      [layerId.toJS, 'visibility'.toJS, (isVisible ? 'visible' : 'none').toJS],
+    );
+  }
+
+  @override
+  Future<Point> toScreenLocation(LatLng latLng) async {
+    final point = _mapOrThrow.callMethodVarArgs<JSObject>(
+      'project'.toJS,
+      [
+        <JSAny?>[latLng.longitude.toJS, latLng.latitude.toJS].toJS,
+      ],
+    );
+    return Point(
+      (point['x'] as JSNumber).toDartDouble.round(),
+      (point['y'] as JSNumber).toDartDouble.round(),
+    );
+  }
+
+  @override
+  Future<List<Point>> toScreenLocationBatch(Iterable<LatLng> latLngs) async {
+    return [
+      for (final latLng in latLngs) await toScreenLocation(latLng),
+    ];
+  }
+
+  @override
+  Future<LatLng> toLatLng(Point screenLocation) async {
+    final point = JSObject()
+      ..['x'] = screenLocation.x.toJS
+      ..['y'] = screenLocation.y.toJS;
+    final lngLat = _mapOrThrow.callMethodVarArgs<JSObject>(
+      'unproject'.toJS,
+      [point],
+    );
+    return LatLng(
+      (lngLat['lat'] as JSNumber).toDartDouble,
+      (lngLat['lng'] as JSNumber).toDartDouble,
+    );
+  }
+
+  @override
+  Future<double> getMetersPerPixelAtLatitude(double latitude) async {
+    // https://wiki.openstreetmap.org/wiki/Zoom_levels
+    const circumference = 40075017.686;
+    final zoom =
+        _mapOrThrow.callMethodVarArgs<JSNumber>('getZoom'.toJS).toDartDouble;
+    return circumference * cos(latitude * (pi / 180)) / pow(2, zoom + 9);
+  }
+
+  @override
+  Future<void> addSource(String sourceId, SourceProperties properties) async {
+    _mapOrThrow.callMethodVarArgs(
+      'addSource'.toJS,
+      [sourceId.toJS, _jsify(properties.toJson())],
+    );
+  }
+
+  @override
+  Future<void> addImageSource(
+    String imageSourceId,
+    Uint8List bytes,
+    LatLngQuad coordinates,
+  ) async {
+    // Mapbox GL JS image sources require a URL; use a data URL by default.
+    final dataUrl = 'data:image/png;base64,${base64Encode(bytes)}';
+    _imageSourceDataUrlById[imageSourceId] = dataUrl;
+
+    final coords = <JSAny?>[
+      <JSAny?>[
+        coordinates.topLeft.longitude.toJS,
+        coordinates.topLeft.latitude.toJS,
+      ].toJS,
+      <JSAny?>[
+        coordinates.topRight.longitude.toJS,
+        coordinates.topRight.latitude.toJS,
+      ].toJS,
+      <JSAny?>[
+        coordinates.bottomRight.longitude.toJS,
+        coordinates.bottomRight.latitude.toJS,
+      ].toJS,
+      <JSAny?>[
+        coordinates.bottomLeft.longitude.toJS,
+        coordinates.bottomLeft.latitude.toJS,
+      ].toJS,
+    ].toJS;
+
+    final source = JSObject()
+      ..['type'] = 'image'.toJS
+      ..['url'] = dataUrl.toJS
+      ..['coordinates'] = coords;
+
+    _mapOrThrow
+        .callMethodVarArgs('addSource'.toJS, [imageSourceId.toJS, source]);
+  }
+
+  @override
+  Future<void> updateImageSource(
+    String imageSourceId,
+    Uint8List? bytes,
+    LatLngQuad? coordinates,
+  ) async {
+    final source = _mapOrThrow
+        .callMethodVarArgs<JSObject>('getSource'.toJS, [imageSourceId.toJS]);
+
+    String? url;
+    if (bytes != null) {
+      url = 'data:image/png;base64,${base64Encode(bytes)}';
+      _imageSourceDataUrlById[imageSourceId] = url;
+    } else {
+      url = _imageSourceDataUrlById[imageSourceId];
+    }
+
+    JSAny? coords;
+    if (coordinates != null) {
+      coords = <JSAny?>[
+        <JSAny?>[
+          coordinates.topLeft.longitude.toJS,
+          coordinates.topLeft.latitude.toJS,
+        ].toJS,
+        <JSAny?>[
+          coordinates.topRight.longitude.toJS,
+          coordinates.topRight.latitude.toJS,
+        ].toJS,
+        <JSAny?>[
+          coordinates.bottomRight.longitude.toJS,
+          coordinates.bottomRight.latitude.toJS,
+        ].toJS,
+        <JSAny?>[
+          coordinates.bottomLeft.longitude.toJS,
+          coordinates.bottomLeft.latitude.toJS,
+        ].toJS,
+      ].toJS;
+    }
+
+    final opts = JSObject();
+    if (url != null) opts['url'] = url.toJS;
+    if (coords != null) opts['coordinates'] = coords;
+
+    source.callMethodVarArgs('updateImage'.toJS, [opts]);
+  }
+
+  @override
+  Future<void> addLayer(
+    String imageLayerId,
+    String imageSourceId,
+    double? minzoom,
+    double? maxzoom,
+  ) async {
+    final layer = JSObject()
+      ..['id'] = imageLayerId.toJS
+      ..['type'] = 'raster'.toJS
+      ..['source'] = imageSourceId.toJS;
+    if (minzoom != null) layer['minzoom'] = minzoom.toJS;
+    if (maxzoom != null) layer['maxzoom'] = maxzoom.toJS;
+    await removeLayer(imageLayerId);
+    _mapOrThrow.callMethodVarArgs('addLayer'.toJS, [layer]);
+  }
+
+  @override
+  Future<void> addLayerBelow(
+    String imageLayerId,
+    String imageSourceId,
+    String belowLayerId,
+    double? minzoom,
+    double? maxzoom,
+  ) async {
+    final layer = JSObject()
+      ..['id'] = imageLayerId.toJS
+      ..['type'] = 'raster'.toJS
+      ..['source'] = imageSourceId.toJS;
+    if (minzoom != null) layer['minzoom'] = minzoom.toJS;
+    if (maxzoom != null) layer['maxzoom'] = maxzoom.toJS;
+    await removeLayer(imageLayerId);
+    _mapOrThrow.callMethodVarArgs('addLayer'.toJS, [layer, belowLayerId.toJS]);
+  }
+
+  @override
+  Future<void> updateContentInsets(EdgeInsets insets, bool animated) async {
+    final padding = JSObject()
+      ..['left'] = insets.left.toJS
+      ..['top'] = insets.top.toJS
+      ..['right'] = insets.right.toJS
+      ..['bottom'] = insets.bottom.toJS;
+
+    final opts = JSObject()
+      ..['padding'] = padding
+      ..['duration'] = (animated ? 250 : 0).toJS;
+    _mapOrThrow.callMethodVarArgs('easeTo'.toJS, [opts]);
+  }
+
+  @override
+  Future<String> takeSnapshot(SnapshotOptions snapshotOptions) async {
+    if (snapshotOptions.styleUri != null || snapshotOptions.styleJson != null) {
+      throw UnsupportedError('style option is not supported on web');
+    }
+    if (snapshotOptions.bounds != null) {
+      throw UnsupportedError('bounds option is not supported on web');
+    }
+    if (snapshotOptions.centerCoordinate != null ||
+        snapshotOptions.zoomLevel != null ||
+        snapshotOptions.pitch != 0 ||
+        snapshotOptions.heading != 0) {
+      throw UnsupportedError('camera option is not supported on web');
+    }
+
+    final canvas =
+        _mapOrThrow.callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS);
+    return canvas.toDataURL('image/png');
+  }
+
+  @override
+  void resizeWebMap() {
+    _onMapResize();
+  }
+
+  @override
+  void forceResizeWebMap() {
+    _mapOrThrow.callMethodVarArgs('resize'.toJS);
   }
 
   /*
@@ -547,27 +1645,26 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
    */
   @override
   void setAttributionButtonMargins(int x, int y) {
-    print('setAttributionButtonMargins not available in web');
+    debugPrint('setAttributionButtonMargins not available in web');
   }
 
   @override
   void setCameraTargetBounds(LatLngBounds? bounds) {
     if (bounds == null) {
-      _map.setMaxBounds(null);
-    } else {
-      _map.setMaxBounds(
-        LngLatBounds(
-          LngLat(
-            bounds.southwest.longitude,
-            bounds.southwest.latitude,
-          ),
-          LngLat(
-            bounds.northeast.longitude,
-            bounds.northeast.latitude,
-          ),
-        ),
-      );
+      _mapOrThrow.callMethodVarArgs('setMaxBounds'.toJS, [null]);
+      return;
     }
+    final sw = <JSAny?>[
+      bounds.southwest.longitude.toJS,
+      bounds.southwest.latitude.toJS,
+    ].toJS;
+    final ne = <JSAny?>[
+      bounds.northeast.longitude.toJS,
+      bounds.northeast.latitude.toJS,
+    ].toJS;
+    _mapOrThrow.callMethodVarArgs('setMaxBounds'.toJS, [
+      <JSAny?>[sw, ne].toJS
+    ]);
   }
 
   @override
@@ -582,24 +1679,25 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   @override
   void setAttributionButtonAlignment(AttributionButtonPosition position) {
-    print('setAttributionButtonAlignment not available in web');
+    debugPrint('setAttributionButtonAlignment not available in web');
   }
 
   @override
   void setCompassViewMargins(int x, int y) {
-    print('setCompassViewMargins not available in web');
+    debugPrint('setCompassViewMargins not available in web');
   }
 
   @override
   void setLogoViewMargins(int x, int y) {
-    print('setLogoViewMargins not available in web');
+    debugPrint('setLogoViewMargins not available in web');
   }
 
   @override
   void setMinMaxZoomPreference(num? min, num? max) {
-    // FIX: why is called indefinitely? (map_ui page)
-    _map.setMinZoom(min);
-    _map.setMaxZoom(max);
+    final minZoom = (min ?? 0).toJS;
+    final maxZoom = (max ?? _defaultMaxZoom).toJS;
+    _mapOrThrow.callMethodVarArgs('setMinZoom'.toJS, [minZoom]);
+    _mapOrThrow.callMethodVarArgs('setMaxZoom'.toJS, [maxZoom]);
   }
 
   @override
@@ -613,460 +1711,68 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   @override
   void setMyLocationRenderMode(int myLocationRenderMode) {
-    print('myLocationRenderMode not available in web');
+    debugPrint('myLocationRenderMode not available in web');
   }
 
   @override
   void setMyLocationTrackingMode(int myLocationTrackingMode) {
     if (_geolocateControl == null) {
-      //myLocationEnabled is false, ignore myLocationTrackingMode
       return;
     }
     if (myLocationTrackingMode == 0) {
       _addGeolocateControl(trackUserLocation: false);
     } else {
-      print('Only one tracking mode available in web');
       _addGeolocateControl(trackUserLocation: true);
     }
   }
 
   @override
   void setStyleString(String? styleString) {
-    //remove old mouseenter callbacks to avoid multicalling
-    for (var layerId in _interactiveFeatureLayerIds) {
-      _map.off('mouseenter', layerId, _onMouseEnterFeature);
-      _map.off('mousemouve', layerId, _onMouseEnterFeature);
-      _map.off('mouseleave', layerId, _onMouseLeaveFeature);
-      if (_dragEnabled) _map.off('mousedown', layerId, _onMouseDown);
+    for (final layerId in _interactiveFeatureLayerIds) {
+      _mapOffLayer('mouseenter', layerId, _onMouseEnterFeatureJs);
+      _mapOffLayer('mousemove', layerId, _onMouseEnterFeatureJs);
+      _mapOffLayer('mouseleave', layerId, _onMouseLeaveFeatureJs);
+      if (_dragEnabled) _mapOffLayer('mousedown', layerId, _onMouseDownJs);
     }
     _interactiveFeatureLayerIds.clear();
 
+    final shouldWaitForStyleLoad = _mapReady;
+    if (shouldWaitForStyleLoad) {
+      _mapReady = false;
+      _mapOnce('styledata', _onStyleLoadedJs);
+    }
+
     try {
       final styleJson = jsonDecode(styleString ?? '');
-      final styleJsObject = jsUtil.jsify(styleJson);
-      _map.setStyle(styleJsObject);
+      _mapOrThrow.callMethodVarArgs('setStyle'.toJS, [_jsify(styleJson)]);
     } catch (_) {
-      _map.setStyle(styleString);
+      _mapOrThrow.callMethodVarArgs('setStyle'.toJS, [styleString?.toJS]);
     }
-    // catch style loaded for later style changes
-    if (_mapReady) {
-      _map.once("styledata", _onStyleLoaded);
-    }
+  }
+
+  @override
+  void setGestures({
+    required bool rotateGesturesEnabled,
+    required bool scrollGesturesEnabled,
+    required bool tiltGesturesEnabled,
+    required bool zoomGesturesEnabled,
+    required bool doubleClickZoomEnabled,
+  }) {
+    _setHandlerEnabled('dragPan', scrollGesturesEnabled);
+    _setHandlerEnabled('scrollZoom', zoomGesturesEnabled);
+    _setHandlerEnabled('doubleClickZoom', doubleClickZoomEnabled);
+
+    // dragRotate is shared by both gestures.
+    _setHandlerEnabled(
+        'dragRotate', tiltGesturesEnabled && rotateGesturesEnabled);
+
+    // touchZoomRotate handles pinch zoom and rotation.
+    _setHandlerEnabled(
+        'touchZoomRotate', zoomGesturesEnabled || rotateGesturesEnabled);
   }
 
   @override
   void setTrackCameraPosition(bool trackCameraPosition) {
     _trackCameraPosition = trackCameraPosition;
-  }
-
-  @override
-  Future<Point> toScreenLocation(LatLng latLng) async {
-    var screenPosition =
-        _map.project(LngLat(latLng.longitude, latLng.latitude));
-    return Point(screenPosition.x.round(), screenPosition.y.round());
-  }
-
-  @override
-  Future<List<Point>> toScreenLocationBatch(Iterable<LatLng> latLngs) async {
-    return latLngs.map((latLng) {
-      var screenPosition =
-          _map.project(LngLat(latLng.longitude, latLng.latitude));
-      return Point(screenPosition.x.round(), screenPosition.y.round());
-    }).toList(growable: false);
-  }
-
-  @override
-  Future<LatLng> toLatLng(Point screenLocation) async {
-    var lngLat =
-        _map.unproject(mapbox.Point(screenLocation.x, screenLocation.y));
-    return LatLng(lngLat.lat as double, lngLat.lng as double);
-  }
-
-  @override
-  Future<double> getMetersPerPixelAtLatitude(double latitude) async {
-    //https://wiki.openstreetmap.org/wiki/Zoom_levels
-    var circumference = 40075017.686;
-    var zoom = _map.getZoom();
-    return circumference * cos(latitude * (pi / 180)) / pow(2, zoom + 9);
-  }
-
-  @override
-  Future<void> removeLayer(String layerId) async {
-    if (_map.getLayer(layerId) != null) {
-      _interactiveFeatureLayerIds.remove(layerId);
-      _map.removeLayer(layerId);
-    }
-  }
-
-  @override
-  Future<void> setFilter(String layerId, dynamic filter) async {
-    _map.setFilter(layerId, filter);
-  }
-
-  @override
-  Future<void> setVisibility(String layerId, bool isVisible) async {
-    final layer = _map.getLayer(layerId);
-    if (layer != null) {
-      _map.setLayoutProperty(
-          layerId, 'visibility', isVisible ? 'visible' : 'none');
-    }
-  }
-
-  @override
-  Future<void> addGeoJsonSource(String sourceId, Map<String, dynamic> geojson,
-      {String? promoteId}) async {
-    final data = _makeFeatureCollection(geojson);
-    _addedFeaturesByLayer[sourceId] = data;
-    _map.addSource(sourceId, {
-      "type": 'geojson',
-      "data": geojson, // pass the raw string here to avoid errors
-      if (promoteId != null) "promoteId": promoteId
-    });
-  }
-
-  Feature _makeFeature(Map<String, dynamic> geojsonFeature) {
-    return Feature(
-        geometry: Geometry(
-            type: geojsonFeature["geometry"]["type"],
-            coordinates: geojsonFeature["geometry"]["coordinates"]),
-        properties: geojsonFeature["properties"],
-        id: geojsonFeature["properties"]?["id"] ?? geojsonFeature["id"]);
-  }
-
-  FeatureCollection _makeFeatureCollection(Map<String, dynamic> geojson) {
-    return FeatureCollection(
-        features: [for (final f in geojson["features"] ?? []) _makeFeature(f)]);
-  }
-
-  @override
-  Future<void> setGeoJsonSource(
-      String sourceId, Map<String, dynamic> geojson) async {
-    final source = _map.getSource(sourceId) as GeoJsonSource;
-    final data = _makeFeatureCollection(geojson);
-    _addedFeaturesByLayer[sourceId] = data;
-    source.setData(data);
-  }
-
-  @override
-  Future<void> addCircleLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    return _addLayer(sourceId, layerId, properties, "circle",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        filter: filter,
-        enableInteraction: enableInteraction);
-  }
-
-  @override
-  Future<void> addFillLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    return _addLayer(sourceId, layerId, properties, "fill",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        filter: filter,
-        enableInteraction: enableInteraction);
-  }
-
-  @override
-  Future<void> addFillExtrusionLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    return _addLayer(sourceId, layerId, properties, "fill-extrusion",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        filter: filter,
-        enableInteraction: enableInteraction);
-  }
-
-  @override
-  Future<void> addLineLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    return _addLayer(sourceId, layerId, properties, "line",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        filter: filter,
-        enableInteraction: enableInteraction);
-  }
-
-  @override
-  Future<void> addSymbolLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    return _addLayer(sourceId, layerId, properties, "symbol",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        filter: filter,
-        enableInteraction: enableInteraction);
-  }
-
-  @override
-  Future<void> addHillshadeLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom}) async {
-    return _addLayer(sourceId, layerId, properties, "hillshade",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        enableInteraction: false);
-  }
-
-  @override
-  Future<void> addHeatmapLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom}) async {
-    return _addLayer(sourceId, layerId, properties, "heatmap",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        enableInteraction: false);
-  }
-
-  @override
-  Future<void> addRasterLayer(
-      String sourceId, String layerId, Map<String, dynamic> properties,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom}) async {
-    await _addLayer(sourceId, layerId, properties, "raster",
-        belowLayerId: belowLayerId,
-        sourceLayer: sourceLayer,
-        minzoom: minzoom,
-        maxzoom: maxzoom,
-        enableInteraction: false);
-  }
-
-  Future<void> _addLayer(String sourceId, String layerId,
-      Map<String, dynamic> properties, String layerType,
-      {String? belowLayerId,
-      String? sourceLayer,
-      double? minzoom,
-      double? maxzoom,
-      dynamic filter,
-      required bool enableInteraction}) async {
-    final layout = Map.fromEntries(
-        properties.entries.where((entry) => isLayoutProperty(entry.key)));
-    final paint = Map.fromEntries(
-        properties.entries.where((entry) => !isLayoutProperty(entry.key)));
-
-    removeLayer(layerId);
-
-    _map.addLayer({
-      'id': layerId,
-      'type': layerType,
-      'source': sourceId,
-      'layout': layout,
-      'paint': paint,
-      if (sourceLayer != null) 'source-layer': sourceLayer,
-      if (minzoom != null) 'minzoom': minzoom,
-      if (maxzoom != null) 'maxzoom': maxzoom,
-      if (filter != null) 'filter': filter,
-    }, belowLayerId);
-
-    if (enableInteraction) {
-      _interactiveFeatureLayerIds.add(layerId);
-      if (layerType == "fill") {
-        _map.on('mousemove', layerId, _onMouseEnterFeature);
-      } else {
-        _map.on('mouseenter', layerId, _onMouseEnterFeature);
-      }
-      _map.on('mouseleave', layerId, _onMouseLeaveFeature);
-      if (_dragEnabled) _map.on('mousedown', layerId, _onMouseDown);
-    }
-  }
-
-  void _onMouseEnterFeature(_) {
-    if (_draggedFeatureId == null) {
-      _map.getCanvas().style.cursor = 'pointer';
-    }
-  }
-
-  void _onMouseLeaveFeature(_) {
-    _map.getCanvas().style.cursor = '';
-  }
-
-  @override
-  void setGestures(
-      {required bool rotateGesturesEnabled,
-      required bool scrollGesturesEnabled,
-      required bool tiltGesturesEnabled,
-      required bool zoomGesturesEnabled,
-      required bool doubleClickZoomEnabled}) {
-    if (rotateGesturesEnabled &&
-        scrollGesturesEnabled &&
-        tiltGesturesEnabled &&
-        zoomGesturesEnabled) {
-      _map.keyboard.enable();
-    } else {
-      _map.keyboard.disable();
-    }
-
-    if (scrollGesturesEnabled) {
-      _map.dragPan.enable();
-    } else {
-      _map.dragPan.disable();
-    }
-
-    if (zoomGesturesEnabled) {
-      _map.doubleClickZoom.enable();
-      _map.boxZoom.enable();
-      _map.scrollZoom.enable();
-      _map.touchZoomRotate.enable();
-    } else {
-      _map.doubleClickZoom.disable();
-      _map.boxZoom.disable();
-      _map.scrollZoom.disable();
-      _map.touchZoomRotate.disable();
-    }
-
-    if (doubleClickZoomEnabled) {
-      _map.doubleClickZoom.enable();
-    } else {
-      _map.doubleClickZoom.disable();
-    }
-
-    if (rotateGesturesEnabled) {
-      _map.touchZoomRotate.enableRotation();
-    } else {
-      _map.touchZoomRotate.disableRotation();
-    }
-
-    // dragRotate is shared by both gestures
-    if (tiltGesturesEnabled && rotateGesturesEnabled) {
-      _map.dragRotate.enable();
-    } else {
-      _map.dragRotate.disable();
-    }
-  }
-
-  @override
-  Future<void> addSource(String sourceId, SourceProperties source) async {
-    _map.addSource(sourceId, source.toJson());
-  }
-
-  Future<void> addImageSource(
-      String imageSourceId, Uint8List bytes, LatLngQuad coordinates) {
-    // TODO: implement addImageSource
-    throw UnimplementedError();
-  }
-
-  Future<void> updateImageSource(
-      String imageSourceId, Uint8List? bytes, LatLngQuad? coordinates) {
-    // TODO: implement addImageSource
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> addLayer(String imageLayerId, String imageSourceId,
-      double? minzoom, double? maxzoom) {
-    // TODO: implement addLayer
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> addLayerBelow(String imageLayerId, String imageSourceId,
-      String belowLayerId, double? minzoom, double? maxzoom) {
-    // TODO: implement addLayerBelow
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> updateContentInsets(EdgeInsets insets, bool animated) {
-    // TODO: implement updateContentInsets
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> setFeatureForGeoJsonSource(
-      String sourceId, Map<String, dynamic> geojsonFeature) async {
-    final source = _map.getSource(sourceId) as GeoJsonSource?;
-    final data = _addedFeaturesByLayer[sourceId];
-
-    if (source != null && data != null) {
-      final feature = _makeFeature(geojsonFeature);
-      final features = data.features.toList();
-      final index = features.indexWhere((f) => f.id == feature.id);
-      if (index >= 0) {
-        features[index] = feature;
-        final newData = FeatureCollection(features: features);
-        _addedFeaturesByLayer[sourceId] = newData;
-
-        source.setData(newData);
-      }
-    }
-  }
-
-  @override
-  Future<String> takeSnapshot(SnapshotOptions snapshotOptions) async {
-    if (snapshotOptions.styleUri != null || snapshotOptions.styleJson != null) {
-      throw UnsupportedError("style option is not supported");
-    }
-    if (snapshotOptions.bounds != null) {
-      throw UnsupportedError("bounds option is not supported");
-    }
-    if (snapshotOptions.centerCoordinate != null ||
-        snapshotOptions.zoomLevel != null ||
-        snapshotOptions.pitch != 0 ||
-        snapshotOptions.heading != 0) {
-      throw UnsupportedError("camera posision option is not supported");
-    }
-    final base64String = await _map.getCanvas().toDataUrl('image/jpeg');
-    return base64String;
-  }
-
-  @override
-  void resizeWebMap() {
-    _onMapResize();
-  }
-
-  @override
-  void forceResizeWebMap() {
-    _map.resize();
   }
 }

@@ -22,6 +22,10 @@ dependency_overrides:
   mapbox_gl_web:
     path: ./mapbox_gl_web
 
+dev_dependencies:
+  mustache_template: ^2.0.0
+  recase: ^4.0.0
+
 flutter:
   plugin:
     platforms:

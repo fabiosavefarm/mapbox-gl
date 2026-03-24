@@ -88,6 +88,33 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
   JSObject get _mapOrThrow =>
       _map ?? (throw StateError('Mapbox GL map is not initialized yet.'));
 
+  T? _callMapMethodOrNull<T extends JSAny?>(String method,
+      [List<JSAny?>? args]) {
+    try {
+      return _mapOrThrow.callMethodVarArgs<T>(method.toJS, args);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  web.HTMLElement? _mapContainerOrNull() {
+    final container = _callMapMethodOrNull<JSAny?>('getContainer');
+    if (container == null) return null;
+    return container as web.HTMLElement;
+  }
+
+  web.HTMLCanvasElement? _mapCanvasOrNull() {
+    final canvas = _callMapMethodOrNull<JSAny?>('getCanvas');
+    if (canvas == null) return null;
+    return canvas as web.HTMLCanvasElement;
+  }
+
+  void _setCanvasCursor(String cursor) {
+    final canvas = _mapCanvasOrNull();
+    if (canvas == null) return;
+    canvas.style.cursor = cursor;
+  }
+
   @override
   Widget buildView(
     Map<String, dynamic> creationParams,
@@ -354,14 +381,13 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   void _onMapResize() {
     Timer(Duration.zero, () {
-      final container =
-          _mapOrThrow.callMethodVarArgs<web.HTMLElement>('getContainer'.toJS);
-      final canvas = _mapOrThrow
-          .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS);
+      final container = _mapContainerOrNull();
+      final canvas = _mapCanvasOrNull();
+      if (container == null || canvas == null) return;
       final widthMismatch = canvas.clientWidth != container.clientWidth;
       final heightMismatch = canvas.clientHeight != container.clientHeight;
       if (widthMismatch || heightMismatch) {
-        _mapOrThrow.callMethodVarArgs('resize'.toJS);
+        _callMapMethodOrNull<JSAny?>('resize');
       }
     });
   }
@@ -474,10 +500,7 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
     e.callMethodVarArgs('preventDefault'.toJS);
 
     _draggedFeatureId = _dartifyViaJson(feature['id']);
-    _mapOrThrow
-        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
-        .style
-        .cursor = 'grabbing';
+    _setCanvasCursor('grabbing');
 
     final lngLat = e['lngLat'] as JSObject;
     _dragOrigin = LatLng(
@@ -531,10 +554,7 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
     _draggedFeatureId = null;
     _dragPrevious = null;
     _dragOrigin = null;
-    _mapOrThrow
-        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
-        .style
-        .cursor = '';
+    _setCanvasCursor('');
   }
 
   void _onMouseMove(JSAny? event) {
@@ -562,17 +582,11 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   void _onMouseEnterFeature() {
     if (_draggedFeatureId != null) return;
-    _mapOrThrow
-        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
-        .style
-        .cursor = 'pointer';
+    _setCanvasCursor('pointer');
   }
 
   void _onMouseLeaveFeature() {
-    _mapOrThrow
-        .callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS)
-        .style
-        .cursor = '';
+    _setCanvasCursor('');
   }
 
   void _onCameraTrackingChanged(bool isTracking) {
@@ -1625,8 +1639,10 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
       throw UnsupportedError('camera option is not supported on web');
     }
 
-    final canvas =
-        _mapOrThrow.callMethodVarArgs<web.HTMLCanvasElement>('getCanvas'.toJS);
+    final canvas = _mapCanvasOrNull();
+    if (canvas == null) {
+      throw StateError('Mapbox GL canvas is not available yet.');
+    }
     return canvas.toDataURL('image/png');
   }
 
@@ -1711,7 +1727,7 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   @override
   void setMyLocationRenderMode(int myLocationRenderMode) {
-    debugPrint('myLocationRenderMode not available in web');
+    // No-op on web. The mobile render mode concept does not exist in Mapbox GL JS.
   }
 
   @override

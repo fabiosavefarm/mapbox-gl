@@ -1,9 +1,10 @@
 part of mapbox_gl_web;
 
+const String _defaultMapboxGlJsVersion = 'v2.14.1';
 const String _defaultMapboxGlJsUrl =
-    'https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js';
+    'https://api.mapbox.com/mapbox-gl-js/$_defaultMapboxGlJsVersion/mapbox-gl.js';
 const String _defaultMapboxGlCssUrl =
-    'https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.css';
+    'https://api.mapbox.com/mapbox-gl-js/$_defaultMapboxGlJsVersion/mapbox-gl.css';
 
 @JS('globalThis')
 external JSObject get _globalThis;
@@ -13,6 +14,72 @@ external JSString? _jsonStringify(JSAny? value);
 
 Future<void>? _mapboxGlResourcesLoad;
 Future<void>? _mapboxGlCssLoad;
+bool? _mapboxGlWebDebugEnabledCache;
+
+bool get _mapboxGlWebDebugEnabled {
+  final cached = _mapboxGlWebDebugEnabledCache;
+  if (cached != null) return cached;
+
+  final search = web.window.location.search;
+  final enabled = kDebugMode ||
+      search.contains('mapbox_gl_web_debug=1') ||
+      search.contains('mapbox_gl_web_debug=true') ||
+      search.contains('mapbox_gl_debug=1') ||
+      search.contains('mapbox_gl_debug=true');
+  _mapboxGlWebDebugEnabledCache = enabled;
+  return enabled;
+}
+
+String _mapboxGlRendererLabel() {
+  if (!kIsWeb) return 'non-web';
+  if (isSkwasm) return 'skwasm';
+  if (isCanvasKit) return 'canvaskit';
+  if (kIsWasm) return 'wasm-unknown';
+  return 'js';
+}
+
+String _mapboxGlVersionOrUnknown() {
+  final mapboxgl = _globalThis['mapboxgl'];
+  if (mapboxgl == null) return 'unloaded';
+  final version = (mapboxgl as JSObject)['version'];
+  if (version is JSString) return version.toDart;
+  return 'unknown';
+}
+
+void _logMapboxWebDebug(
+  String stage, [
+  Map<String, Object?> details = const <String, Object?>{},
+]) {
+  if (!_mapboxGlWebDebugEnabled) return;
+  final payload = <String>[
+    'stage=$stage',
+    'renderer=${_mapboxGlRendererLabel()}',
+    'wasm=$kIsWasm',
+    'mapboxGl=${_mapboxGlVersionOrUnknown()}',
+    for (final entry in details.entries) '${entry.key}=${entry.value}',
+  ].join(' ');
+  print('[mapbox_gl_web] $payload');
+}
+
+Never _throwMapboxWebError(
+  String stage,
+  Object error,
+  StackTrace stackTrace, [
+  Map<String, Object?> details = const <String, Object?>{},
+]) {
+  final payload = <String>[
+    'stage=$stage',
+    'renderer=${_mapboxGlRendererLabel()}',
+    'wasm=$kIsWasm',
+    'mapboxGl=${_mapboxGlVersionOrUnknown()}',
+    for (final entry in details.entries) '${entry.key}=${entry.value}',
+  ].join(' ');
+  print('[mapbox_gl_web] ERROR $payload error=$error');
+  if (_mapboxGlWebDebugEnabled) {
+    print(stackTrace);
+  }
+  Error.throwWithStackTrace(error, stackTrace);
+}
 
 bool _isMapboxGlLoaded() => _globalThis.has('mapboxgl');
 
@@ -44,12 +111,17 @@ JSObject _newMapboxGlObject(String constructorName, [JSAny? arg1]) {
 Future<void> _ensureMapboxGlCssLoaded(
     {String cssUrl = _defaultMapboxGlCssUrl}) {
   return _mapboxGlCssLoad ??= () async {
+    _logMapboxWebDebug('ensure-css:start', <String, Object?>{'cssUrl': cssUrl});
     final existing = web.document.querySelectorAll('link[rel="stylesheet"]');
     for (var i = 0; i < existing.length; i++) {
       final node = existing.item(i);
       if (node == null) continue;
       final link = node as web.HTMLLinkElement;
       if (link.href == cssUrl || link.href.contains('mapbox-gl.css')) {
+        _logMapboxWebDebug(
+          'ensure-css:reuse',
+          <String, Object?>{'cssUrl': cssUrl},
+        );
         return;
       }
     }
@@ -81,12 +153,21 @@ Future<void> _ensureMapboxGlCssLoaded(
 
     (web.document.head ?? web.document.documentElement)!.appendChild(link);
     await completer.future;
+    _logMapboxWebDebug('ensure-css:ready', <String, Object?>{'cssUrl': cssUrl});
   }();
 }
 
 Future<void> _ensureMapboxGlJsLoaded({String jsUrl = _defaultMapboxGlJsUrl}) {
   return _mapboxGlResourcesLoad ??= () async {
-    if (_isMapboxGlLoaded()) return;
+    if (_isMapboxGlLoaded()) {
+      _logMapboxWebDebug(
+        'ensure-js:reuse',
+        <String, Object?>{'jsUrl': jsUrl},
+      );
+      return;
+    }
+
+    _logMapboxWebDebug('ensure-js:start', <String, Object?>{'jsUrl': jsUrl});
 
     final completer = Completer<void>();
     final script = web.HTMLScriptElement()
@@ -122,6 +203,13 @@ Future<void> _ensureMapboxGlJsLoaded({String jsUrl = _defaultMapboxGlJsUrl}) {
         'Loaded Mapbox GL JS script, but `globalThis.mapboxgl` is still missing.',
       );
     }
+    _logMapboxWebDebug(
+      'ensure-js:ready',
+      <String, Object?>{
+        'jsUrl': jsUrl,
+        'version': _mapboxGlVersionOrUnknown(),
+      },
+    );
   }();
 }
 

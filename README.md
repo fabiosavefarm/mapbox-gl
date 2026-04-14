@@ -71,8 +71,8 @@ curl: (22) The requested URL returned error: 401 Unauthorized
 Include the JavaScript and CSS files in the `<head>` of your `index.html` file:
 
 ```
-<script src='https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js'></script>
-<link href='https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.css' rel='stylesheet' />
+<script src='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.js'></script>
+<link href='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.css' rel='stylesheet' />
 
 <style>
    .mapboxgl-map {
@@ -84,6 +84,23 @@ Include the JavaScript and CSS files in the `<head>` of your `index.html` file:
 ```
 
 *Note: Look for latest version in [Mapbox GL JS documentation](https://docs.mapbox.com/mapbox-gl-js/guides/).*
+
+### WebAssembly (WASM)
+
+The web package uses `dart:js_interop`, `dart:ui_web`, and `package:web`, so it can be compiled with Flutter WebAssembly builds:
+
+```
+flutter build web --wasm
+```
+
+For runtime diagnostics on web, add `?mapbox_gl_web_debug=1` to the URL.
+
+The example app also includes a dedicated smoke test entrypoint:
+
+```
+cd example
+flutter run -d chrome --wasm -t lib/wasm_smoke_main.dart --dart-define=ACCESS_TOKEN=YOUR_TOKEN_HERE
+```
 
 ### All platforms
 

@@ -34,59 +34,73 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
   final _imageSourceDataUrlById = <String, String>{};
 
   late final JSFunction _onStyleLoadedJs = ((JSAny? _) {
-    _onStyleLoaded();
+    _runGuardedCallback('event:style-loaded', _onStyleLoaded);
   }).toJS;
 
   late final JSFunction _onMapClickJs = ((JSAny? e) {
-    _onMapClick(e);
+    _runGuardedCallback('event:map-click', () => _onMapClick(e));
   }).toJS;
 
   late final JSFunction _onMapLongClickJs = ((JSAny? e) {
-    _onMapLongClick(e);
+    _runGuardedCallback('event:map-long-click', () => _onMapLongClick(e));
   }).toJS;
 
   late final JSFunction _onCameraMoveStartedJs = ((JSAny? _) {
-    onCameraMoveStartedPlatform(null);
+    _runGuardedCallback(
+      'event:camera-move-started',
+      () => onCameraMoveStartedPlatform(null),
+    );
   }).toJS;
 
   late final JSFunction _onCameraMoveJs = ((JSAny? _) {
-    _onCameraMove();
+    _runGuardedCallback('event:camera-move', _onCameraMove);
   }).toJS;
 
   late final JSFunction _onCameraIdleJs = ((JSAny? _) {
-    _onCameraIdle();
+    _runGuardedCallback('event:camera-idle', _onCameraIdle);
   }).toJS;
 
   late final JSFunction _onResizeEventJs = ((JSAny? _) {
-    _onMapResize();
+    _runGuardedCallback('event:resize', _onMapResize);
   }).toJS;
 
   late final JSFunction _onStyleImageMissingJs = ((JSAny? e) {
-    _loadMissingImageFromAssets(e);
+    _runGuardedCallback(
+      'event:style-image-missing',
+      () => _loadMissingImageFromAssets(e),
+    );
   }).toJS;
 
   late final JSFunction _onMouseDownJs = ((JSAny? e) {
-    _onMouseDown(e);
+    _runGuardedCallback('event:mouse-down', () => _onMouseDown(e));
   }).toJS;
 
   late final JSFunction _onMouseUpJs = ((JSAny? e) {
-    _onMouseUp(e);
+    _runGuardedCallback('event:mouse-up', () => _onMouseUp(e));
   }).toJS;
 
   late final JSFunction _onMouseMoveJs = ((JSAny? e) {
-    _onMouseMove(e);
+    _runGuardedCallback('event:mouse-move', () => _onMouseMove(e));
   }).toJS;
 
   late final JSFunction _onMouseEnterFeatureJs = ((JSAny? _) {
-    _onMouseEnterFeature();
+    _runGuardedCallback('event:mouse-enter-feature', _onMouseEnterFeature);
   }).toJS;
 
   late final JSFunction _onMouseLeaveFeatureJs = ((JSAny? _) {
-    _onMouseLeaveFeature();
+    _runGuardedCallback('event:mouse-leave-feature', _onMouseLeaveFeature);
   }).toJS;
 
   JSObject get _mapOrThrow =>
       _map ?? (throw StateError('Mapbox GL map is not initialized yet.'));
+
+  void _runGuardedCallback(String stage, void Function() callback) {
+    try {
+      callback();
+    } catch (error, stackTrace) {
+      _throwMapboxWebError(stage, error, stackTrace);
+    }
+  }
 
   T? _callMapMethodOrNull<T extends JSAny?>(String method,
       [List<JSAny?>? args]) {
@@ -123,6 +137,10 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
   ) {
     _creationParams = creationParams;
     final identifier = hashCode;
+    _logMapboxWebDebug(
+      'build-view',
+      <String, Object?>{'identifier': identifier},
+    );
     _registerViewFactory(onPlatformViewCreated, identifier);
     return HtmlElementView(viewType: '$_viewTypePrefix$identifier');
   }
@@ -131,6 +149,10 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
     Function(int) callback,
     int identifier,
   ) {
+    _logMapboxWebDebug(
+      'register-view-factory',
+      <String, Object?>{'identifier': identifier},
+    );
     ui_web.platformViewRegistry.registerViewFactory(
       '$_viewTypePrefix$identifier',
       (int viewId) {
@@ -151,6 +173,7 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
   @override
   void dispose() {
     super.dispose();
+    _logMapboxWebDebug('dispose');
     _resizeObserverDebounce?.cancel();
     _resizeObserver?.disconnect();
 
@@ -180,59 +203,96 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
         (_creationParams['mapboxGlJsUrl'] as String?) ?? _defaultMapboxGlJsUrl;
     final cssUrl = (_creationParams['mapboxGlCssUrl'] as String?) ??
         _defaultMapboxGlCssUrl;
-    await _ensureMapboxGlResourcesLoaded(jsUrl: jsUrl, cssUrl: cssUrl);
 
-    final accessToken = _creationParams['accessToken'];
-    if (accessToken is String && accessToken.isNotEmpty) {
-      _setMapboxAccessToken(accessToken);
-    }
+    _logMapboxWebDebug(
+      'init-platform:start',
+      <String, Object?>{
+        'id': id,
+        'dragEnabled': _dragEnabled,
+        'jsUrl': jsUrl,
+        'cssUrl': cssUrl,
+      },
+    );
 
-    final initialCamera = _creationParams['initialCameraPosition'];
-    if (initialCamera is! Map) {
-      throw StateError('Missing `initialCameraPosition` for Mapbox GL web.');
-    }
+    try {
+      await _ensureMapboxGlResourcesLoaded(jsUrl: jsUrl, cssUrl: cssUrl);
 
-    final target = initialCamera['target'];
-    if (target is! List || target.length != 2) {
-      throw StateError('Invalid `initialCameraPosition.target` payload.');
-    }
+      final accessToken = _creationParams['accessToken'];
+      if (accessToken is String && accessToken.isNotEmpty) {
+        _setMapboxAccessToken(accessToken);
+      }
 
-    final center = <JSAny?>[
-      (target[1] as num).toJS,
-      (target[0] as num).toJS,
-    ].toJS;
+      final initialCamera = _creationParams['initialCameraPosition'];
+      if (initialCamera is! Map) {
+        throw StateError('Missing `initialCameraPosition` for Mapbox GL web.');
+      }
 
-    final mapOptions = JSObject()
-      ..['container'] = _mapElement
-      ..['style'] = _defaultStyle.toJS
-      ..['center'] = center
-      ..['zoom'] = (initialCamera['zoom'] as num?)?.toJS
-      ..['bearing'] = (initialCamera['bearing'] as num?)?.toJS
-      ..['pitch'] = (initialCamera['tilt'] as num?)?.toJS
-      ..['preserveDrawingBuffer'] = true.toJS;
+      final target = initialCamera['target'];
+      if (target is! List || target.length != 2) {
+        throw StateError('Invalid `initialCameraPosition.target` payload.');
+      }
 
-    _map = _newMapboxGlObject('Map', mapOptions);
+      final center = <JSAny?>[
+        (target[1] as num).toJS,
+        (target[0] as num).toJS,
+      ].toJS;
 
-    _mapOn('load', _onStyleLoadedJs);
-    _mapOn('click', _onMapClickJs);
-    // Long click is not available in Mapbox GL JS; map it to double-click.
-    _mapOn('dblclick', _onMapLongClickJs);
-    _mapOn('movestart', _onCameraMoveStartedJs);
-    _mapOn('move', _onCameraMoveJs);
-    _mapOn('moveend', _onCameraIdleJs);
-    _mapOn('resize', _onResizeEventJs);
-    _mapOn('styleimagemissing', _onStyleImageMissingJs);
+      final mapOptions = JSObject()
+        ..['container'] = _mapElement
+        ..['style'] = _defaultStyle.toJS
+        ..['center'] = center
+        ..['zoom'] = (initialCamera['zoom'] as num?)?.toJS
+        ..['bearing'] = (initialCamera['bearing'] as num?)?.toJS
+        ..['pitch'] = (initialCamera['tilt'] as num?)?.toJS
+        ..['preserveDrawingBuffer'] = true.toJS;
 
-    if (_dragEnabled) {
-      _mapOn('mouseup', _onMouseUpJs);
-      _mapOn('mousemove', _onMouseMoveJs);
-    }
+      _logMapboxWebDebug(
+        'init-platform:create-map',
+        <String, Object?>{
+          'zoom': initialCamera['zoom'],
+          'bearing': initialCamera['bearing'],
+          'pitch': initialCamera['tilt'],
+        },
+      );
+      _map = _newMapboxGlObject('Map', mapOptions);
 
-    _initResizeObserver();
+      _mapOn('load', _onStyleLoadedJs);
+      _mapOn('click', _onMapClickJs);
+      // Long click is not available in Mapbox GL JS; map it to double-click.
+      _mapOn('dblclick', _onMapLongClickJs);
+      _mapOn('movestart', _onCameraMoveStartedJs);
+      _mapOn('move', _onCameraMoveJs);
+      _mapOn('moveend', _onCameraIdleJs);
+      _mapOn('resize', _onResizeEventJs);
+      _mapOn('styleimagemissing', _onStyleImageMissingJs);
 
-    final options = _creationParams['options'];
-    if (options is Map<String, dynamic>) {
-      _applyOptionsUpdate(options);
+      if (_dragEnabled) {
+        _mapOn('mouseup', _onMouseUpJs);
+        _mapOn('mousemove', _onMouseMoveJs);
+      }
+
+      _initResizeObserver();
+
+      final options = _creationParams['options'];
+      if (options is Map<String, dynamic>) {
+        _applyOptionsUpdate(options);
+      }
+
+      _logMapboxWebDebug(
+        'init-platform:ready',
+        <String, Object?>{'id': id},
+      );
+    } catch (error, stackTrace) {
+      _throwMapboxWebError(
+        'init-platform',
+        error,
+        stackTrace,
+        <String, Object?>{
+          'id': id,
+          'jsUrl': jsUrl,
+          'cssUrl': cssUrl,
+        },
+      );
     }
   }
 
@@ -1440,16 +1500,28 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   @override
   Future<Point> toScreenLocation(LatLng latLng) async {
-    final point = _mapOrThrow.callMethodVarArgs<JSObject>(
-      'project'.toJS,
-      [
-        <JSAny?>[latLng.longitude.toJS, latLng.latitude.toJS].toJS,
-      ],
-    );
-    return Point(
-      (point['x'] as JSNumber).toDartDouble.round(),
-      (point['y'] as JSNumber).toDartDouble.round(),
-    );
+    try {
+      final point = _mapOrThrow.callMethodVarArgs<JSObject>(
+        'project'.toJS,
+        [
+          <JSAny?>[latLng.longitude.toJS, latLng.latitude.toJS].toJS,
+        ],
+      );
+      return Point(
+        (point['x'] as JSNumber).toDartDouble.round(),
+        (point['y'] as JSNumber).toDartDouble.round(),
+      );
+    } catch (error, stackTrace) {
+      _throwMapboxWebError(
+        'to-screen-location',
+        error,
+        stackTrace,
+        <String, Object?>{
+          'lat': latLng.latitude,
+          'lon': latLng.longitude,
+        },
+      );
+    }
   }
 
   @override
@@ -1461,17 +1533,29 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
 
   @override
   Future<LatLng> toLatLng(Point screenLocation) async {
-    final point = JSObject()
-      ..['x'] = screenLocation.x.toJS
-      ..['y'] = screenLocation.y.toJS;
-    final lngLat = _mapOrThrow.callMethodVarArgs<JSObject>(
-      'unproject'.toJS,
-      [point],
-    );
-    return LatLng(
-      (lngLat['lat'] as JSNumber).toDartDouble,
-      (lngLat['lng'] as JSNumber).toDartDouble,
-    );
+    try {
+      final point = JSObject()
+        ..['x'] = screenLocation.x.toJS
+        ..['y'] = screenLocation.y.toJS;
+      final lngLat = _mapOrThrow.callMethodVarArgs<JSObject>(
+        'unproject'.toJS,
+        [point],
+      );
+      return LatLng(
+        (lngLat['lat'] as JSNumber).toDartDouble,
+        (lngLat['lng'] as JSNumber).toDartDouble,
+      );
+    } catch (error, stackTrace) {
+      _throwMapboxWebError(
+        'to-lat-lng',
+        error,
+        stackTrace,
+        <String, Object?>{
+          'x': screenLocation.x,
+          'y': screenLocation.y,
+        },
+      );
+    }
   }
 
   @override

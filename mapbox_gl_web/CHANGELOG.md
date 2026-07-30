@@ -1,3 +1,7 @@
+## Unreleased
+* Upgrade the default Mapbox GL JS web runtime to 3.25.0.
+* Document direct PMTiles vector sources through the official Mapbox provider.
+
 ## 0.16.0, May 19, 2022
 * Fix type issues in query rendered features in rect [#862](https://github.com/flutter-mapbox-gl/maps/pull/862)
 * Annotation manager moved to dart [#779](https://github.com/flutter-mapbox-gl/maps/pull/779)

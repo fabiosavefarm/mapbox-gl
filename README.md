@@ -71,8 +71,8 @@ curl: (22) The requested URL returned error: 401 Unauthorized
 Include the JavaScript and CSS files in the `<head>` of your `index.html` file:
 
 ```
-<script src='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.js'></script>
-<link href='https://api.mapbox.com/mapbox-gl-js/v2.14.1/mapbox-gl.css' rel='stylesheet' />
+<script src='https://api.mapbox.com/mapbox-gl-js/v3.25.0/mapbox-gl.js'></script>
+<link href='https://api.mapbox.com/mapbox-gl-js/v3.25.0/mapbox-gl.css' rel='stylesheet' />
 
 <style>
    .mapboxgl-map {
@@ -84,6 +84,11 @@ Include the JavaScript and CSS files in the `<head>` of your `index.html` file:
 ```
 
 *Note: Look for latest version in [Mapbox GL JS documentation](https://docs.mapbox.com/mapbox-gl-js/guides/).*
+
+Mapbox GL JS v3 can read PMTiles archives directly through its official tile
+provider. Pass an HTTPS URL ending in `.pmtiles` (signed query parameters are
+supported) to `VectorSourceProperties.url`, then reference the archive's vector
+layer with `sourceLayer` when adding the style layer.
 
 ### WebAssembly (WASM)
 

@@ -1,6 +1,6 @@
 part of mapbox_gl_web;
 
-const String _defaultMapboxGlJsVersion = 'v2.14.1';
+const String _defaultMapboxGlJsVersion = 'v3.25.0';
 const String _defaultMapboxGlJsUrl =
     'https://api.mapbox.com/mapbox-gl-js/$_defaultMapboxGlJsVersion/mapbox-gl.js';
 const String _defaultMapboxGlCssUrl =

@@ -60,6 +60,12 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
     _runGuardedCallback('event:camera-idle', _onCameraIdle);
   }).toJS;
 
+  late final JSFunction _onMapIdleJs = ((JSAny? _) {
+    _runGuardedCallback('event:map-idle', () {
+      if (_mapReady) onMapIdlePlatform(null);
+    });
+  }).toJS;
+
   late final JSFunction _onResizeEventJs = ((JSAny? _) {
     _runGuardedCallback('event:resize', _onMapResize);
   }).toJS;
@@ -263,6 +269,7 @@ class MapboxWebGlPlatform extends MapboxGlPlatform
       _mapOn('movestart', _onCameraMoveStartedJs);
       _mapOn('move', _onCameraMoveJs);
       _mapOn('moveend', _onCameraIdleJs);
+      _mapOn('idle', _onMapIdleJs);
       _mapOn('resize', _onResizeEventJs);
       _mapOn('styleimagemissing', _onStyleImageMissingJs);
 
